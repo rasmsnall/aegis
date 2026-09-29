@@ -36,7 +36,7 @@ That wouldn't work if each server had its own proxy.
 ## Usage
 
 ```sh
-cargo install --path .
+cargo install mcp-aegis                    # installs the `aegis` command
 aegis check  -c aegis.toml                 # validate config
 aegis run    -c aegis.toml                 # serve MCP on stdio
 aegis verify aegis-audit.jsonl             # check the log's hash chain
@@ -87,4 +87,5 @@ reason = "shell commands are disabled once untrusted content is in context"
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
