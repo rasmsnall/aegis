@@ -1,0 +1,70 @@
+# Example aegis configuration.
+#
+# Point your agent at `aegis run --config aegis.toml` instead of at the MCP
+# servers directly. Tools are exposed as <server>__<tool>, e.g. shell__exec.
+
+[audit]
+path = "aegis-audit.jsonl"
+
+[policy]
+# What happens to a tool call no rule matches.
+default = "allow"
+
+# --- Upstream MCP servers (stdio) ----------------------------------------
+
+[[server]]
+name = "web"
+command = "uvx"
+args = ["mcp-server-fetch"]
+
+[[server]]
+name = "github"
+command = "github-mcp-server"
+args = ["stdio"]
+env = { GITHUB_TOOLSETS = "repos,issues,pull_requests" }
+
+[[server]]
+name = "shell"
+command = "my-shell-mcp-server"
+
+# --- Sources: labels attached to tool output ------------------------------
+# Once a session has seen output with a label, the label stays for the rest
+# of the session.
+
+[[source]]
+tool = "web__*"
+labels = ["untrusted", "external"]
+
+# Issue and PR text is written by anyone who can open one.
+[[source]]
+tool = "github__get_issue*"
+labels = ["untrusted"]
+
+[[source]]
+tool = "github__*pull_request*"
+labels = ["untrusted"]
+
+# --- Rules: checked in order, first match decides ------------------------
+
+[[rule]]
+tool = "shell__*"
+when_context_has = ["untrusted"]
+action = "deny"
+reason = "shell commands are disabled once untrusted content is in context"
+
+[[rule]]
+tool = "github__push_files"
+when_context_has = ["untrusted"]
+action = "deny"
+reason = "pushing is disabled once untrusted content is in context"
+
+[[rule]]
+tool = "github__create_or_update_file"
+when_context_has = ["untrusted"]
+action = "deny"
+reason = "writing files is disabled once untrusted content is in context"
+
+[[rule]]
+tool = "github__delete_*"
+action = "deny"
+reason = "deletion is never allowed through this agent"
