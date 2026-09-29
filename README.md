@@ -85,6 +85,11 @@ reason = "shell commands are disabled once untrusted content is in context"
   (e.g. trust by URL domain), and OS-level enforcement so tools can't
   get around the proxy.
 
+## Website
+
+`site/` is a TypeScript/React (Vite) site with an in-browser playground that
+runs the same policy rules. Run it with `cd site && npm install && npm run dev`.
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
