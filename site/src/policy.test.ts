@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { decide, examplePolicy, globMatch, labelsForResult } from "./policy.ts";
+import { decide, examplePolicy, globMatch, labelsForResult, toToml } from "./policy.ts";
 
 test("glob matching matches the Rust implementation's cases", () => {
   assert.ok(globMatch("shell__exec", "shell__exec"));
@@ -27,4 +27,20 @@ test("shell is allowed until untrusted data is read", () => {
 
 test("unconditional rule applies on a clean context", () => {
   assert.equal(decide(examplePolicy, "github__delete_file", new Set()).rule, 3);
+});
+
+test("toToml emits the config format aegis reads", () => {
+  const toml = toToml({
+    default: "deny",
+    sources: [{ tool: "web__*", labels: ["untrusted"] }],
+    rules: [{ tool: "shell__*", whenContextHas: ["untrusted"], action: "deny", reason: 'no "shell"' }],
+  });
+  assert.equal(
+    toml,
+    [
+      '[policy]\ndefault = "deny"',
+      '[[source]]\ntool = "web__*"\nlabels = ["untrusted"]',
+      '[[rule]]\ntool = "shell__*"\nwhen_context_has = ["untrusted"]\naction = "deny"\nreason = "no \\"shell\\""',
+    ].join("\n\n"),
+  );
 });

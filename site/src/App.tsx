@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
+import { FlowField, type FlowEvent } from "./FlowField.tsx";
 import { Playground } from "./Playground.tsx";
 import { Steps } from "./Steps.tsx";
-import { TickField } from "./TickField.tsx";
 
 const REPO = "https://github.com/rasmsnall/aegis";
 const INSTALL = "cargo install mcp-aegis";
@@ -39,7 +39,7 @@ function InstallButton() {
   const [copied, setCopied] = useState(false);
   return (
     <button
-      className="btn btn-white"
+      className="btn btn-outline btn-install"
       onClick={() => {
         navigator.clipboard
           ?.writeText(INSTALL)
@@ -49,7 +49,7 @@ function InstallButton() {
           })
           .catch(() => {
             // Clipboard refused: select the command so it can be copied by hand.
-            const text = document.querySelector(".btn-white .mono");
+            const text = document.querySelector(".btn-install .mono");
             if (text) window.getSelection()?.selectAllChildren(text);
           });
       }}
@@ -60,34 +60,97 @@ function InstallButton() {
 }
 
 export function App() {
+  const lineRef = useRef<HTMLDivElement>(null);
+  const heroRef = useRef<HTMLElement>(null);
+  const stoppedRef = useRef<HTMLElement>(null);
+  const leakedRef = useRef<HTMLElement>(null);
+  const counts = useRef({ stopped: 0, leaked: 0 });
+  const [guarded, setGuarded] = useState(true);
+
+  // Counters update on every packet, so write to the DOM instead of re-rendering.
+  const onFlow = useCallback((e: FlowEvent) => {
+    counts.current[e] += 1;
+    const el = e === "stopped" ? stoppedRef.current : leakedRef.current;
+    if (el) el.textContent = String(counts.current[e]);
+  }, []);
+
   return (
     <>
       <header className="nav">
-        <a className="logo" href="#top">
-          <Shield />
-          aegis
-        </a>
-        <nav>
-          <a href="#how">How it works</a>
-          <a href="#playground">Playground</a>
-          <a href="#start">Get started</a>
-        </nav>
-        <a className="btn btn-blue nav-cta" href={REPO}>
-          GitHub
-        </a>
+        <div className="nav-inner wrap">
+          <a className="logo" href="#top">
+            <Shield />
+            aegis
+          </a>
+          <nav>
+            <a href="#how">How it works</a>
+            <a href="#playground">Playground</a>
+            <a href="#start">Get started</a>
+          </nav>
+          <a className="btn btn-outline nav-cta" href={REPO}>
+            GitHub
+          </a>
+        </div>
       </header>
 
       <main id="top">
-        <section className="hero">
-          <TickField />
-          <div className="hero-content">
-            <h1>Where agent security starts</h1>
-            <p className="hero-sub">Label. Track. Enforce. Record. One firewall between your agent and its tools.</p>
-            <div className="hero-actions">
-              <a className="btn btn-blue" href="#playground">
-                Try the playground
-              </a>
-              <InstallButton />
+        <section className="hero" ref={heroRef}>
+          <FlowField lineRef={lineRef} hostRef={heroRef} guarded={guarded} onEvent={onFlow} />
+          <p className="hero-hint mono">Click anywhere up here to inject untrusted data</p>
+          <div className="hero-content wrap">
+            <div className={`policy-line ${guarded ? "" : "off"}`} ref={lineRef}>
+              <span className="mono">
+                {guarded ? (
+                  <>
+                    rule #1 · deny <b>shell__*</b> when context has <b className="taint">untrusted</b>
+                  </>
+                ) : (
+                  "policy off · untrusted data passes"
+                )}
+              </span>
+            </div>
+            <h1>
+              Untrusted data
+              <br />
+              {guarded ? "stops here." : "gets through."}
+            </h1>
+            <div className="hero-foot">
+              <p className="hero-sub">
+                aegis is a firewall between your AI agent and its tools. It labels everything the agent reads, and
+                blocks the calls your policy forbids once untrusted data is in play.
+              </p>
+              <div className="hero-actions">
+                <a className="btn btn-scarlet" href="#playground">
+                  Try the playground
+                </a>
+                <InstallButton />
+              </div>
+            </div>
+            <div className="hero-meta">
+              <label className="switch switch-small mono" htmlFor="hero-guard">
+                <input id="hero-guard" type="checkbox" checked={guarded} onChange={(e) => setGuarded(e.target.checked)} />
+                <span className="switch-track" aria-hidden />
+                policy line {guarded ? "on" : "off"}
+              </label>
+              <ul className="legend mono" aria-label="Legend">
+                <li>
+                  <i className="swatch swatch-trusted" /> trusted
+                </li>
+                <li>
+                  <i className="swatch swatch-checked" /> passed the policy
+                </li>
+                <li>
+                  <i className="swatch swatch-taint" /> untrusted
+                </li>
+              </ul>
+              <p className="counters mono" aria-live="off">
+                <span>
+                  stopped <b ref={stoppedRef}>0</b>
+                </span>
+                <span className="leaked">
+                  leaked <b ref={leakedRef}>0</b>
+                </span>
+              </p>
             </div>
           </div>
         </section>
@@ -102,6 +165,10 @@ export function App() {
         </section>
 
         <section id="how" className="wrap">
+          <div className="section-head">
+            <p className="mono eyebrow">How it works</p>
+            <h2>Four steps on every call.</h2>
+          </div>
           <Steps />
         </section>
 

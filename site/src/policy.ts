@@ -64,6 +64,24 @@ export function blockMessage(tool: string, d: Decision): string {
   return text;
 }
 
+/** Renders a policy as the `aegis.toml` sections that define it. */
+export function toToml(policy: Policy): string {
+  const q = (s: string) => JSON.stringify(s);
+  const list = (xs: string[]) => `[${xs.map(q).join(", ")}]`;
+  const parts = [`[policy]\ndefault = ${q(policy.default)}`];
+  for (const s of policy.sources) {
+    parts.push(`[[source]]\ntool = ${q(s.tool)}\nlabels = ${list(s.labels)}`);
+  }
+  for (const r of policy.rules) {
+    let rule = `[[rule]]\ntool = ${q(r.tool)}\n`;
+    if (r.whenContextHas.length > 0) rule += `when_context_has = ${list(r.whenContextHas)}\n`;
+    rule += `action = ${q(r.action)}`;
+    if (r.reason) rule += `\nreason = ${q(r.reason)}`;
+    parts.push(rule);
+  }
+  return parts.join("\n\n");
+}
+
 export const examplePolicy: Policy = {
   default: "allow",
   sources: [
