@@ -381,7 +381,7 @@ main > section:not(.hero) { padding-top: 128px; }
 .log { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 460px; overflow-y: auto; }
 .log li { border-left: 6px solid var(--fg-3); background: var(--surface-2); padding: 10px 14px; }
 .log li.denied { border-left-color: var(--scarlet); background: var(--scarlet-soft); }
-.log li.changed { animation: changed 1.2s ease-out; }
+
 @keyframes changed { from { box-shadow: inset 0 0 0 2px var(--fg); } to { box-shadow: inset 0 0 0 2px transparent; } }
 @media (prefers-reduced-motion: reduce) { .log li.changed { animation: none; box-shadow: inset 0 0 0 1px var(--fg-3); } }
 .log p { margin-top: 6px; overflow-wrap: anywhere; line-height: 1.5; }
@@ -418,6 +418,78 @@ main > section:not(.hero) { padding-top: 128px; }
 .segmented label.on { background: var(--fg); color: var(--ink); }
 .segmented input { position: absolute; opacity: 0; }
 .segmented label:has(input:focus-visible) { outline: 2px solid var(--scarlet); outline-offset: 2px; }
+
+/* Bug report with its hidden instruction. */
+.issue {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  background: var(--ink);
+  border: 1px solid var(--line-strong);
+  transition: border-color 0.4s;
+}
+.issue-title { font-weight: 600; line-height: 1.3; }
+.issue-hidden {
+  font-size: 0.72rem;
+  color: rgb(238 234 230 / 0.16);
+  overflow-wrap: anywhere;
+  transition: color 0.4s;
+}
+.issue.read { border-color: var(--taint); }
+.issue.read .issue-hidden {
+  color: var(--ink);
+  background: linear-gradient(90deg, var(--taint) 50%, transparent 50%) 100% 0 / 200% 100% no-repeat;
+  animation: highlight 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+@keyframes highlight { to { background-position: 0 0; } }
+.issue-flag {
+  justify-self: start;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  color: var(--taint);
+  border: 1px solid var(--taint);
+  animation: pop-in 0.4s 0.5s cubic-bezier(0.3, 1.5, 0.5, 1) both;
+}
+
+.tool.sending { border-left-color: var(--scarlet); animation: sending 0.75s ease-in-out; }
+@keyframes sending { 50% { background: rgb(255 45 31 / 0.14); } }
+
+/* The call currently travelling from the agent to aegis. */
+.wire { position: relative; display: grid; min-height: 58px; padding: 12px 14px 16px; background: var(--ink); border: 1px solid var(--line); overflow: hidden; margin-bottom: 8px; }
+.wire p { font-size: 0.8rem; overflow-wrap: anywhere; }
+.wire-from { color: var(--scarlet); }
+.wire-text { display: inline-block; vertical-align: bottom; white-space: nowrap; overflow: hidden; max-width: 100%; animation: type 0.55s steps(36, end) both; }
+@keyframes type { from { max-width: 0; } to { max-width: 100%; } }
+.wire-idle { color: var(--fg-3); }
+.wire-idle::after { content: "_"; margin-left: 2px; animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.wire-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--surface-2); }
+.wire-bar.live::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 30%; background: var(--scarlet); animation: travel 0.75s ease-in-out both; }
+@keyframes travel { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+
+/* Decisions arrive, and say how they went. */
+.log li { animation: entry-in 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+@keyframes entry-in { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
+.log li.denied { animation: entry-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1) both, shake 0.4s 0.3s, flash 0.9s 0.3s; }
+@keyframes shake { 20%, 60% { transform: translateX(-6px); } 40%, 80% { transform: translateX(6px); } }
+@keyframes flash { from { box-shadow: inset 0 0 0 2px var(--scarlet), 0 0 24px rgb(255 45 31 / 0.45); } to { box-shadow: none; } }
+.log li.harmed { border-left-color: var(--taint); animation: entry-in 0.35s both, harm 1.2s 0.3s 2; }
+@keyframes harm { 50% { background: var(--taint-soft); box-shadow: 0 0 22px rgb(245 180 42 / 0.35); } }
+.log-head code .dim { font-size: 0.72rem; }
+.log li.changed { animation: changed 1.2s ease-out; }
+
+.chip { animation: pop-in 0.35s cubic-bezier(0.3, 1.5, 0.5, 1) both; }
+@keyframes pop-in { from { opacity: 0; transform: scale(0.6); } to { opacity: 1; transform: none; } }
+.bump { display: inline-block; animation: bump 0.35s cubic-bezier(0.3, 1.6, 0.5, 1); }
+@keyframes bump { 40% { transform: scale(1.25); } }
+.policy-item { transition: background 0.3s, border-color 0.3s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .issue.read .issue-hidden { animation: none; background: var(--taint); }
+  .issue-flag, .tool.sending, .wire-text, .wire-bar.live::after, .wire-idle::after, .log li, .log li.denied, .log li.harmed, .chip, .bump { animation: none; }
+}
 
 .pg-toml { margin-top: 16px; border: 1px solid var(--line); background: var(--surface); }
 .pg-toml pre { max-height: 320px; }
