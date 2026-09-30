@@ -172,6 +172,10 @@ Rust with the `wasm32-unknown-unknown` target
 (`rustup target add wasm32-unknown-unknown`); then run
 `cd site && npm install && npm run dev`.
 
+The site is published at https://rasmsnall.github.io/aegis/. Every push to
+`main` that touches it rebuilds the `gh-pages` branch, which GitHub Pages
+serves.
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
