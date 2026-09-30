@@ -41,10 +41,17 @@ function InstallButton() {
     <button
       className="btn btn-white"
       onClick={() => {
-        navigator.clipboard?.writeText(INSTALL).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        });
+        navigator.clipboard
+          ?.writeText(INSTALL)
+          .then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          })
+          .catch(() => {
+            // Clipboard refused: select the command so it can be copied by hand.
+            const text = document.querySelector(".btn-white .mono");
+            if (text) window.getSelection()?.selectAllChildren(text);
+          });
       }}
     >
       <span className="mono">{copied ? "Copied" : INSTALL}</span>
