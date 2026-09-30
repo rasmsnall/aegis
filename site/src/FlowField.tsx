@@ -69,6 +69,9 @@ export function FlowField({ lineRef, hostRef, guarded, onEvent }: Props) {
     let frame = 0;
     let last = 0;
     let running = false;
+    let visible = true;
+    // With reduced motion, animate only until injected data has settled.
+    let settleAt = 0;
 
     const lineY = () => {
       const line = lineRef.current;
@@ -152,6 +155,10 @@ export function FlowField({ lineRef, hostRef, guarded, onEvent }: Props) {
     const loop = (now: number) => {
       render(last ? Math.min(now - last, 50) : 16);
       last = now;
+      if (!visible || (still && now > settleAt)) {
+        running = false;
+        return;
+      }
       frame = requestAnimationFrame(loop);
     };
 
@@ -162,8 +169,9 @@ export function FlowField({ lineRef, hostRef, guarded, onEvent }: Props) {
       frame = requestAnimationFrame(loop);
     };
 
-    // Inject a burst of untrusted packets around the click.
-    const inject = (ev: PointerEvent) => {
+    // Inject a burst of untrusted packets around the click. A click (not a
+    // pointerdown) so that scrolling over the hero on a phone injects nothing.
+    const inject = (ev: MouseEvent) => {
       if ((ev.target as Element).closest("a, button, input, label, code, pre")) return;
       const rect = canvas.getBoundingClientRect();
       const x = ev.clientX - rect.left;
@@ -175,29 +183,33 @@ export function FlowField({ lineRef, hostRef, guarded, onEvent }: Props) {
         col.packets.push({ y: y - len - rand(0, 60), len, bad: true });
         col.packets.sort((a, b) => a.y - b.y);
       }
-      // Reduced motion: animate only while the injected data is in flight.
       if (still) {
+        settleAt = performance.now() + 4000;
         start();
-        setTimeout(() => {
-          cancelAnimationFrame(frame);
-          running = false;
-        }, 4000);
       }
     };
+
+    // Stop drawing while the hero is scrolled out of view.
+    const intersection = new IntersectionObserver(([entry]) => {
+      visible = entry.isIntersecting;
+      if (visible && !still) start();
+    });
+    intersection.observe(canvas);
 
     const observer = new ResizeObserver(() => {
       setup();
       render(0);
     });
     observer.observe(canvas);
-    host.addEventListener("pointerdown", inject);
+    host.addEventListener("click", inject);
     setup();
     render(0);
     if (!still) start();
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
-      host.removeEventListener("pointerdown", inject);
+      intersection.disconnect();
+      host.removeEventListener("click", inject);
     };
   }, [lineRef, hostRef]);
 

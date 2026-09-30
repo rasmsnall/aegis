@@ -25,6 +25,12 @@ test("shell is allowed until untrusted data is read", () => {
   assert.equal(decide(examplePolicy, "files__read", context).action, "allow");
 });
 
+test("unlisted tools are untrusted by default; labels = [] trusts", () => {
+  assert.deepEqual(labelsForResult(examplePolicy, "files__read"), []);
+  assert.deepEqual(labelsForResult(examplePolicy, "mail__read"), ["untrusted"]);
+  assert.deepEqual(labelsForResult({ ...examplePolicy, defaultLabels: [] }, "mail__read"), []);
+});
+
 test("unconditional rule applies on a clean context", () => {
   assert.equal(decide(examplePolicy, "github__delete_file", new Set()).rule, 3);
 });
@@ -32,13 +38,14 @@ test("unconditional rule applies on a clean context", () => {
 test("toToml emits the config format aegis reads", () => {
   const toml = toToml({
     default: "deny",
+    defaultLabels: ["untrusted"],
     sources: [{ tool: "web__*", labels: ["untrusted"] }],
     rules: [{ tool: "shell__*", whenContextHas: ["untrusted"], action: "deny", reason: 'no "shell"' }],
   });
   assert.equal(
     toml,
     [
-      '[policy]\ndefault = "deny"',
+      '[policy]\ndefault = "deny"\ndefault_labels = ["untrusted"]',
       '[[source]]\ntool = "web__*"\nlabels = ["untrusted"]',
       '[[rule]]\ntool = "shell__*"\nwhen_context_has = ["untrusted"]\naction = "deny"\nreason = "no \\"shell\\""',
     ].join("\n\n"),

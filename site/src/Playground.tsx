@@ -58,7 +58,7 @@ function evaluate(history: string[], policy: Policy) {
   return { entries, context };
 }
 
-const OFF: Policy = { sources: [], rules: [], default: "allow" };
+const OFF: Policy = { sources: [], rules: [], default: "allow", defaultLabels: [] };
 
 export function Playground() {
   const [enabled, setEnabled] = useState(true);
@@ -66,33 +66,43 @@ export function Playground() {
   const [rulesOn, setRulesOn] = useState(() => examplePolicy.rules.map(() => true));
   const [sourcesOn, setSourcesOn] = useState(() => examplePolicy.sources.map(() => true));
   const [defaultAction, setDefaultAction] = useState<Action>("allow");
+  const [untrustedByDefault, setUntrustedByDefault] = useState(true);
+  // Bumped on every policy edit so a repeated change highlights again.
+  const [editVersion, setEditVersion] = useState(0);
   // Indexes of calls whose decision changed with the last policy edit.
   const [changed, setChanged] = useState<Set<number>>(new Set());
 
-  const policyFor = (on: boolean, rules: boolean[], sources: boolean[], def: Action): Policy =>
+  const policyFor = (on: boolean, rules: boolean[], sources: boolean[], def: Action, strict: boolean): Policy =>
     on
       ? {
           default: def,
+          defaultLabels: strict ? ["untrusted"] : [],
           rules: examplePolicy.rules.filter((_, i) => rules[i]),
           sources: examplePolicy.sources.filter((_, i) => sources[i]),
         }
       : OFF;
 
-  const policy = policyFor(enabled, rulesOn, sourcesOn, defaultAction);
+  const policy = useMemo(
+    () => policyFor(enabled, rulesOn, sourcesOn, defaultAction, untrustedByDefault),
+    [enabled, rulesOn, sourcesOn, defaultAction, untrustedByDefault],
+  );
   const { entries, context } = useMemo(() => evaluate(history, policy), [history, policy]);
 
   /** Applies a policy edit and marks the recorded calls it decides differently. */
-  function edit(next: { on?: boolean; rules?: boolean[]; sources?: boolean[]; def?: Action }) {
+  function edit(next: { on?: boolean; rules?: boolean[]; sources?: boolean[]; def?: Action; strict?: boolean }) {
     const on = next.on ?? enabled;
     const rules = next.rules ?? rulesOn;
     const sources = next.sources ?? sourcesOn;
     const def = next.def ?? defaultAction;
-    const after = evaluate(history, policyFor(on, rules, sources, def)).entries;
+    const strict = next.strict ?? untrustedByDefault;
+    const after = evaluate(history, policyFor(on, rules, sources, def, strict)).entries;
     setChanged(new Set(after.flatMap((e, i) => (e.decision.action !== entries[i].decision.action ? [i] : []))));
+    setEditVersion((v) => v + 1);
     setEnabled(on);
     setRulesOn(rules);
     setSourcesOn(sources);
     setDefaultAction(def);
+    setUntrustedByDefault(strict);
   }
 
   function call(tools: string[], fresh = false) {
@@ -171,7 +181,7 @@ export function Playground() {
                 .reverse()
                 .map(({ e, i }) => (
                   <li
-                    key={i}
+                    key={changed.has(i) ? `${i}-${editVersion}` : i}
                     className={`${e.decision.action === "deny" ? "denied" : "allowed"} ${changed.has(i) ? "changed" : ""}`}
                   >
                     <div className="log-head">
@@ -234,10 +244,29 @@ export function Playground() {
                   onChange={(ev) => edit({ sources: sourcesOn.map((v, j) => (j === i ? ev.target.checked : v)) })}
                 />
                 <span>
-                  label <code>{s.tool}</code> output <code>{s.labels.join(", ")}</code>
+                  {s.labels.length > 0 ? (
+                    <>
+                      label <code>{s.tool}</code> output <code>{s.labels.join(", ")}</code>
+                    </>
+                  ) : (
+                    <>
+                      trust <code>{s.tool}</code> output
+                    </>
+                  )}
                 </span>
               </label>
             ))}
+            <label htmlFor="source-default" className={`policy-item ${untrustedByDefault ? "" : "off"}`}>
+              <input
+                id="source-default"
+                type="checkbox"
+                checked={untrustedByDefault}
+                onChange={(ev) => edit({ strict: ev.target.checked })}
+              />
+              <span>
+                label every other tool's output <code>untrusted</code>
+              </span>
+            </label>
           </fieldset>
           <fieldset className="policy-group" disabled={!enabled}>
             <legend className="mono tiny">When no rule matches</legend>

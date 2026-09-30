@@ -20,6 +20,8 @@ export interface Policy {
   sources: Source[];
   rules: Rule[];
   default: Action;
+  /** Labels for output of tools no source matches (untrusted by default). */
+  defaultLabels: string[];
 }
 
 export interface Decision {
@@ -38,9 +40,13 @@ export function globMatch(pattern: string, name: string): boolean {
 
 export function labelsForResult(policy: Policy, tool: string): string[] {
   const labels = new Set<string>();
+  let matched = false;
   for (const source of policy.sources) {
-    if (globMatch(source.tool, tool)) source.labels.forEach((l) => labels.add(l));
+    if (!globMatch(source.tool, tool)) continue;
+    matched = true;
+    source.labels.forEach((l) => labels.add(l));
   }
+  if (!matched) policy.defaultLabels.forEach((l) => labels.add(l));
   return [...labels].sort();
 }
 
@@ -68,7 +74,7 @@ export function blockMessage(tool: string, d: Decision): string {
 export function toToml(policy: Policy): string {
   const q = (s: string) => JSON.stringify(s);
   const list = (xs: string[]) => `[${xs.map(q).join(", ")}]`;
-  const parts = [`[policy]\ndefault = ${q(policy.default)}`];
+  const parts = [`[policy]\ndefault = ${q(policy.default)}\ndefault_labels = ${list(policy.defaultLabels)}`];
   for (const s of policy.sources) {
     parts.push(`[[source]]\ntool = ${q(s.tool)}\nlabels = ${list(s.labels)}`);
   }
@@ -84,9 +90,11 @@ export function toToml(policy: Policy): string {
 
 export const examplePolicy: Policy = {
   default: "allow",
+  defaultLabels: ["untrusted"],
   sources: [
     { tool: "web__*", labels: ["untrusted", "external"] },
     { tool: "github__get_issue*", labels: ["untrusted"] },
+    { tool: "files__*", labels: [] },
   ],
   rules: [
     {
