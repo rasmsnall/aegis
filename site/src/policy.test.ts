@@ -1,38 +1,55 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import { before, test } from "node:test";
 
-import { decide, examplePolicy, globMatch, labelsForResult, toToml } from "./policy.ts";
+import { initEngine, simulate } from "./engine.ts";
+import { examplePolicy, toToml } from "./policy.ts";
 
-test("glob matching matches the Rust implementation's cases", () => {
-  assert.ok(globMatch("shell__exec", "shell__exec"));
-  assert.ok(!globMatch("shell__exec", "shell__exec2"));
-  assert.ok(globMatch("shell__*", "shell__exec"));
-  assert.ok(globMatch("*", ""));
-  assert.ok(globMatch("a*b*c", "axxbyyc"));
-  assert.ok(!globMatch("a*b*c", "axxbyy"));
-  assert.ok(!globMatch("git__*", "github__push"));
-  assert.ok(globMatch("a.b", "a.b") && !globMatch("a.b", "axb"));
+before(async () => {
+  // Built from the Rust crate by `npm run wasm`.
+  await initEngine(readFileSync(new URL("../public/aegis.wasm", import.meta.url)));
 });
 
-test("shell is allowed until untrusted data is read", () => {
-  const context = new Set<string>();
-  assert.equal(decide(examplePolicy, "shell__exec", context).action, "allow");
-  labelsForResult(examplePolicy, "web__fetch").forEach((l) => context.add(l));
-  const d = decide(examplePolicy, "shell__exec", context);
+const calls = (...tools: string[]) => tools.map((tool) => ({ tool }));
+
+test("the engine blocks shell once untrusted data is read", () => {
+  const sim = simulate(examplePolicy, calls("files__read", "web__fetch", "shell__exec"));
+  assert.deepEqual(
+    sim.entries.map((e) => e.runs),
+    [true, true, false],
+  );
+  assert.deepEqual(sim.context, ["external", "untrusted"]);
+  const blocked = sim.entries[2];
+  assert.equal(blocked.decision.action, "deny");
+  assert.equal(blocked.decision.rule, 1);
+  assert.deepEqual(blocked.decision.matchedLabels, ["untrusted"]);
+  assert.match(blocked.message!, /^aegis blocked this call to shell__exec \(rule #1\) because this session has read data labelled untrusted/);
+});
+
+test("files are trusted, unlisted tools are not", () => {
+  assert.deepEqual(simulate(examplePolicy, calls("files__read")).context, []);
+  assert.deepEqual(simulate(examplePolicy, calls("mail__read")).context, ["untrusted"]);
+  const trusting = { ...examplePolicy, defaultLabels: [] };
+  assert.deepEqual(simulate(trusting, calls("mail__read")).context, []);
+});
+
+test("ask runs only with a person's approval", () => {
+  const push = (approved?: boolean) =>
+    simulate(examplePolicy, [{ tool: "github__get_issue" }, { tool: "github__push_files", approved }]).entries[1];
+  assert.equal(push(undefined).decision.action, "ask");
+  assert.equal(push(undefined).runs, false);
+  assert.match(push(undefined).message!, /not approved/);
+  assert.equal(push(false).runs, false);
+  assert.equal(push(true).runs, true);
+  assert.equal(push(true).decision.approved, true);
+});
+
+test("unconditional rules and the default action", () => {
+  assert.equal(simulate(examplePolicy, calls("github__delete_file")).entries[0].decision.rule, 3);
+  const strict = { ...examplePolicy, default: "deny" as const };
+  const d = simulate(strict, calls("files__read")).entries[0].decision;
   assert.equal(d.action, "deny");
-  assert.equal(d.rule, 1);
-  assert.deepEqual(d.matchedLabels, ["untrusted"]);
-  assert.equal(decide(examplePolicy, "files__read", context).action, "allow");
-});
-
-test("unlisted tools are untrusted by default; labels = [] trusts", () => {
-  assert.deepEqual(labelsForResult(examplePolicy, "files__read"), []);
-  assert.deepEqual(labelsForResult(examplePolicy, "mail__read"), ["untrusted"]);
-  assert.deepEqual(labelsForResult({ ...examplePolicy, defaultLabels: [] }, "mail__read"), []);
-});
-
-test("unconditional rule applies on a clean context", () => {
-  assert.equal(decide(examplePolicy, "github__delete_file", new Set()).rule, 3);
+  assert.equal(d.rule, null);
 });
 
 test("toToml emits the config format aegis reads", () => {
@@ -40,14 +57,14 @@ test("toToml emits the config format aegis reads", () => {
     default: "deny",
     defaultLabels: ["untrusted"],
     sources: [{ tool: "web__*", labels: ["untrusted"] }],
-    rules: [{ tool: "shell__*", whenContextHas: ["untrusted"], action: "deny", reason: 'no "shell"' }],
+    rules: [{ tool: "shell__*", whenContextHas: ["untrusted"], action: "ask", reason: 'no "shell"' }],
   });
   assert.equal(
     toml,
     [
       '[policy]\ndefault = "deny"\ndefault_labels = ["untrusted"]',
       '[[source]]\ntool = "web__*"\nlabels = ["untrusted"]',
-      '[[rule]]\ntool = "shell__*"\nwhen_context_has = ["untrusted"]\naction = "deny"\nreason = "no \\"shell\\""',
+      '[[rule]]\ntool = "shell__*"\nwhen_context_has = ["untrusted"]\naction = "ask"\nreason = "no \\"shell\\""',
     ].join("\n\n"),
   );
 });

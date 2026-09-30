@@ -4,40 +4,101 @@
 //! (`<server>__<tool>`), so that one taint context spans all of them: data
 //! read through the `web` server must be able to block a call on the `shell`
 //! server, which is impossible if each server sits behind its own proxy.
+//!
+//! For `action = "ask"` it also acts as a client of the agent's host: it
+//! sends an MCP `elicitation/create` request, which the host shows to the
+//! person using it. The model never sees that request and cannot answer it.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 
-use crate::audit::{AuditLog, Event};
+use crate::audit::{ArgumentLogging, AuditLog, Event, log_arguments};
 use crate::config::NAMESPACE_SEP;
-use crate::policy::{Action, Policy, Session};
-use crate::upstream::{PROTOCOL_VERSION, Upstream, write_line};
+use crate::labels::LabelSet;
+use crate::policy::{Action, Decision, Policy, Session};
+use crate::resources::ResourceStore;
+use crate::upstream::{
+    DEFAULT_MAX_MESSAGE_BYTES, Line, PROTOCOL_VERSION, Upstream, read_line_limited, write_line,
+};
 
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
+
+/// Everything about a proxy beyond its servers and policy.
+pub struct Options {
+    pub audit: Option<AuditLog>,
+    pub arguments: ArgumentLogging,
+    pub redact_keys: Vec<String>,
+    pub resources: Option<ResourceStore>,
+    pub approval_timeout: Duration,
+    pub max_message_bytes: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            audit: None,
+            arguments: ArgumentLogging::default(),
+            redact_keys: Vec::new(),
+            resources: None,
+            approval_timeout: Duration::from_secs(300),
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+/// Why an `ask` call did or didn't run.
+enum Approval {
+    Approved,
+    Declined,
+    TimedOut,
+    Unsupported,
+}
 
 pub struct Proxy {
     upstreams: Vec<Arc<Upstream>>,
     policy: Policy,
     session: Mutex<Session>,
     audit: Mutex<Option<AuditLog>>,
+    resources: Mutex<Option<ResourceStore>>,
+    arguments: ArgumentLogging,
+    redact_keys: Vec<String>,
+    approval_timeout: Duration,
+    max_message_bytes: usize,
+    /// Connection back to the agent's host, for approval requests.
+    client_writer: OnceLock<Writer>,
+    client_pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    client_can_ask: AtomicBool,
+    next_client_id: AtomicU64,
 }
 
 impl Proxy {
     pub fn new(
         upstreams: Vec<Arc<Upstream>>,
         policy: Policy,
-        audit: Option<AuditLog>,
+        options: Options,
     ) -> Result<Arc<Self>> {
         let proxy = Arc::new(Self {
             upstreams,
             policy,
             session: Mutex::default(),
-            audit: Mutex::new(audit),
+            audit: Mutex::new(options.audit),
+            resources: Mutex::new(options.resources.filter(|r| !r.is_empty())),
+            arguments: options.arguments,
+            redact_keys: options.redact_keys,
+            approval_timeout: options.approval_timeout,
+            max_message_bytes: options.max_message_bytes,
+            client_writer: OnceLock::new(),
+            client_pending: Mutex::default(),
+            client_can_ask: AtomicBool::new(false),
+            next_client_id: AtomicU64::new(1),
         });
         if let Some(log) = proxy.audit.try_lock().expect("fresh mutex").as_mut() {
             let servers = proxy.upstreams.iter().map(|u| u.name.clone()).collect();
@@ -59,9 +120,22 @@ impl Proxy {
         writer: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Result<()> {
         let writer: Writer = Arc::new(Mutex::new(Box::new(writer)));
+        let _ = self.client_writer.set(writer.clone());
         let mut tasks = JoinSet::new();
-        let mut lines = BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await? {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let line = match read_line_limited(&mut reader, self.max_message_bytes).await? {
+                Line::Text(line) => line,
+                Line::Eof => break,
+                Line::TooLong(n) => {
+                    let message = format!(
+                        "message of {n} bytes exceeds the {}-byte limit",
+                        self.max_message_bytes
+                    );
+                    write_line(&writer, &error_response(Value::Null, -32600, &message)).await?;
+                    continue;
+                }
+            };
             while tasks.try_join_next().is_some() {}
             if line.trim().is_empty() {
                 continue;
@@ -74,19 +148,28 @@ impl Proxy {
                     continue;
                 }
             };
-            // Notifications need no reply.
             let Some(id) = msg.get("id").cloned() else {
-                continue;
+                continue; // Notifications need no reply.
             };
-            let method = msg
+            let Some(method) = msg
                 .get("method")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+                .map(str::to_string)
+            else {
+                // A response to one of our own requests (an approval prompt).
+                let key = id
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| id.to_string());
+                if let Some(tx) = self.client_pending.lock().await.remove(&key) {
+                    let _ = tx.send(msg);
+                }
+                continue;
+            };
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
-            // Handle each request on its own task so a slow tool does not
-            // block the others.
+            // Handle each request on its own task so a slow tool (or a
+            // person thinking about an approval) does not block the others.
             let proxy = self.clone();
             let writer = writer.clone();
             tasks.spawn(async move {
@@ -100,6 +183,8 @@ impl Proxy {
                 }
             });
         }
+        // Nobody is left to answer approval prompts.
+        self.client_pending.lock().await.clear();
         // Let in-flight calls finish before the connection is dropped.
         while tasks.join_next().await.is_some() {}
         Ok(())
@@ -109,14 +194,18 @@ impl Proxy {
     /// internal failure.
     async fn handle(&self, method: &str, params: Value) -> Result<Result<Value, Value>> {
         match method {
-            "initialize" => Ok(Ok(json!({
-                "protocolVersion": params
-                    .get("protocolVersion")
-                    .cloned()
-                    .unwrap_or_else(|| PROTOCOL_VERSION.into()),
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "aegis", "version": env!("CARGO_PKG_VERSION") },
-            }))),
+            "initialize" => {
+                let can_ask = params.pointer("/capabilities/elicitation").is_some();
+                self.client_can_ask.store(can_ask, Ordering::Release);
+                Ok(Ok(json!({
+                    "protocolVersion": params
+                        .get("protocolVersion")
+                        .cloned()
+                        .unwrap_or_else(|| PROTOCOL_VERSION.into()),
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "aegis", "version": env!("CARGO_PKG_VERSION") },
+                })))
+            }
             "ping" => Ok(Ok(json!({}))),
             "tools/list" => self.list_tools().await.map(Ok),
             "tools/call" => self.call_tool(params).await,
@@ -157,40 +246,48 @@ impl Proxy {
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-        let (decision, context) = {
+        let (mut decision, context) = {
             let session = self.session.lock().await;
             (
                 session.check_call(&self.policy, &name),
                 session.context().clone(),
             )
         };
+        let mut note = None;
+        if decision.action == Action::Ask {
+            let approval = self.ask_person(&name, &arguments, &decision).await;
+            decision.approved = Some(matches!(approval, Approval::Approved));
+            note = match approval {
+                Approval::Approved | Approval::Declined => None,
+                Approval::TimedOut => Some("nobody answered in time"),
+                Approval::Unsupported => Some("the agent's MCP client cannot ask for approval"),
+            };
+        }
         // Fail closed: a call that cannot be logged does not run.
         self.record(Event::ToolCall {
             tool: name.clone(),
-            arguments,
-            context: context.into_iter().collect(),
+            arguments: log_arguments(self.arguments, &arguments, &self.redact_keys),
+            context: context.iter().cloned().collect(),
             decision: decision.clone(),
         })
         .await
         .context("writing audit log")?;
 
-        if decision.action == Action::Deny {
-            let rule = decision
-                .rule
-                .map_or("default policy".to_string(), |r| format!("rule #{r}"));
-            let mut text = format!("aegis blocked this call to {name} ({rule})");
-            if !decision.matched_labels.is_empty() {
-                text += &format!(
-                    " because this session has read data labelled {}",
-                    decision.matched_labels.join(", ")
-                );
-            }
-            if let Some(reason) = &decision.reason {
-                text += &format!(": {reason}");
+        if !decision.runs() {
+            let mut text = decision.message(&name);
+            if let Some(note) = note {
+                text += &format!(" ({note})");
             }
             return Ok(Ok(
                 json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
             ));
+        }
+
+        // Remember what this write carries into later sessions.
+        if let Some(store) = self.resources.lock().await.as_mut() {
+            store
+                .on_write(&name, &arguments, &context)
+                .context("saving resource labels")?;
         }
 
         params["name"] = Value::String(tool);
@@ -204,19 +301,110 @@ impl Proxy {
                 .unwrap_or(false),
             Err(_) => true,
         };
-        let added = self
-            .session
-            .lock()
-            .await
-            .observe_result(&self.policy, &name);
+        let recalled: LabelSet = match self.resources.lock().await.as_ref() {
+            Some(store) => store.on_read(&name, &arguments),
+            None => LabelSet::new(),
+        };
+        let added = {
+            let mut session = self.session.lock().await;
+            let mut added = session.observe_result(&self.policy, &name);
+            added.extend(session.add_labels(recalled.iter().cloned()));
+            added
+        };
         self.record(Event::ToolResult {
             tool: name,
             is_error,
             added: added.into_iter().collect(),
+            recalled: recalled.into_iter().collect(),
         })
         .await
         .context("writing audit log")?;
         Ok(response)
+    }
+
+    /// Asks the person behind the agent whether `tool` may run.
+    async fn ask_person(&self, tool: &str, arguments: &Value, decision: &Decision) -> Approval {
+        let Some(writer) = self.client_writer.get() else {
+            return Approval::Unsupported;
+        };
+        if !self.client_can_ask.load(Ordering::Acquire) {
+            return Approval::Unsupported;
+        }
+        // Show the person the call as it will be logged, secrets redacted.
+        let mut shown =
+            log_arguments(ArgumentLogging::Redacted, arguments, &self.redact_keys).to_string();
+        if shown.len() > 600 {
+            let mut cut = 600;
+            while !shown.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            shown.truncate(cut);
+            shown += "…";
+        }
+        let why = match (&decision.rule, decision.matched_labels.is_empty()) {
+            (Some(r), false) => format!(
+                "Rule #{r} asks for approval because this session has read data labelled {}.",
+                decision.matched_labels.join(", ")
+            ),
+            (Some(r), true) => format!("Rule #{r} asks for approval."),
+            (None, _) => "The default policy asks for approval.".to_string(),
+        };
+        let message = format!(
+            "aegis: the agent wants to call {tool} with {shown}\n\n{why}{}\n\nAllow this one call?",
+            decision
+                .reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
+        );
+
+        let id = format!(
+            "aegis-{}",
+            self.next_client_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = oneshot::channel();
+        self.client_pending.lock().await.insert(id.clone(), tx);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "elicitation/create",
+            "params": {
+                "message": message,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "approve": {
+                            "type": "boolean",
+                            "title": "Allow this call",
+                            "description": format!("Run {tool} once, despite the rule."),
+                        }
+                    },
+                    "required": ["approve"],
+                },
+            },
+        });
+        if let Err(e) = write_line(writer, &request).await {
+            eprintln!("aegis: asking for approval: {e}");
+            self.client_pending.lock().await.remove(&id);
+            return Approval::Unsupported;
+        }
+        match tokio::time::timeout(self.approval_timeout, rx).await {
+            Ok(Ok(response)) => {
+                let result = &response["result"];
+                let approved = result["action"] == "accept" && result["content"]["approve"] == true;
+                if approved {
+                    Approval::Approved
+                } else {
+                    Approval::Declined
+                }
+            }
+            // The client answered with an error, or went away.
+            Ok(Err(_)) => Approval::Declined,
+            Err(_) => {
+                self.client_pending.lock().await.remove(&id);
+                Approval::TimedOut
+            }
+        }
     }
 
     async fn record(&self, event: Event) -> Result<()> {

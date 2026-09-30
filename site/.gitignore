@@ -1,2 +1,4 @@
 node_modules
 dist
+# Built from the Rust crate by `npm run wasm`.
+public/aegis.wasm

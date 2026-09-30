@@ -22,10 +22,13 @@ pub struct Report {
 
 /// Replays `entries` against `policy`.
 ///
-/// Labels depend only on which tools returned output, so taint can be
-/// recomputed exactly, with one approximation: a call the recording denied but
-/// `policy` allows is assumed to have returned output, and a call the
-/// recording allowed but `policy` denies has its result ignored.
+/// Labels depend only on which tools returned output (plus any labels
+/// recalled from earlier sessions' files, which the log records), so taint can
+/// be recomputed exactly, with two approximations: a call the recording did
+/// not run but `policy` would is assumed to have returned output, and a call
+/// the recording ran but `policy` would not has its result ignored. A call
+/// `policy` would `ask` about is assumed to be approved, which can only add
+/// taint, never hide it.
 pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
     let mut report = Report::default();
     let mut session = Session::default();
@@ -45,11 +48,12 @@ pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
             } => {
                 report.calls += 1;
                 let replayed = session.check_call(policy, tool);
-                match (recorded.action, replayed.action) {
-                    (Action::Allow, Action::Deny) => {
+                let would_run = replayed.action != Action::Deny;
+                match (recorded.runs(), would_run) {
+                    (true, false) => {
                         *suppressed.entry(tool).or_default() += 1;
                     }
-                    (Action::Deny, Action::Allow) => {
+                    (false, true) => {
                         session.observe_result(policy, tool);
                     }
                     _ => {}
@@ -64,11 +68,12 @@ pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
                 }
             }
             Event::SessionEnd => {}
-            Event::ToolResult { tool, .. } => {
+            Event::ToolResult { tool, recalled, .. } => {
                 if let Some(n) = suppressed.get_mut(tool.as_str()).filter(|n| **n > 0) {
                     *n -= 1;
                 } else {
                     session.observe_result(policy, tool);
+                    session.add_labels(recalled.iter().cloned());
                 }
             }
         }
@@ -104,6 +109,7 @@ mod tests {
                     rule: None,
                     matched_labels: vec![],
                     reason: None,
+                    approved: None,
                 },
             },
         )
@@ -116,6 +122,7 @@ mod tests {
                 tool: tool.into(),
                 is_error: false,
                 added: vec![],
+                recalled: vec![],
             },
         )
     }

@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 
@@ -20,6 +20,57 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Request timeout used when none is configured.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Message size limit used when none is configured.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One newline-delimited message, read with a size limit.
+pub(crate) enum Line {
+    Text(String),
+    /// The message exceeded the limit; it was read to its end and dropped.
+    TooLong(usize),
+    Eof,
+}
+
+/// Reads one line without ever buffering more than `max` bytes of it.
+pub(crate) async fn read_line_limited<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Line> {
+    let mut buf = Vec::new();
+    let mut total = 0usize;
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(match (total, too_long) {
+                (0, _) => Line::Eof,
+                (_, true) => Line::TooLong(total),
+                _ => Line::Text(String::from_utf8_lossy(&buf).into_owned()),
+            });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let chunk = &available[..newline.unwrap_or(available.len())];
+        total += chunk.len();
+        if !too_long {
+            if buf.len() + chunk.len() > max {
+                too_long = true;
+                buf = Vec::new();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        let used = chunk.len() + usize::from(newline.is_some());
+        reader.consume(used);
+        if newline.is_some() {
+            return Ok(if too_long {
+                Line::TooLong(total)
+            } else {
+                Line::Text(String::from_utf8_lossy(&buf).into_owned())
+            });
+        }
+    }
+}
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
@@ -29,12 +80,14 @@ pub struct Upstream {
     pending: Pending,
     next_id: AtomicU64,
     call_timeout: Duration,
+    /// Set once the server's output has ended or been cut off.
+    closed: Arc<AtomicBool>,
     _child: Option<Child>,
 }
 
 impl Upstream {
     /// Launches the server process and performs the MCP initialize handshake.
-    pub async fn spawn(config: &ServerConfig) -> Result<Arc<Self>> {
+    pub async fn spawn(config: &ServerConfig, max_message_bytes: usize) -> Result<Arc<Self>> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .envs(&config.env)
@@ -54,6 +107,7 @@ impl Upstream {
             stdin,
             Some(child),
             Duration::from_secs(config.call_timeout_secs),
+            max_message_bytes,
         );
         let startup = Duration::from_secs(config.startup_timeout_secs);
         tokio::time::timeout(startup, upstream.initialize())
@@ -76,6 +130,7 @@ impl Upstream {
         writer: impl AsyncWrite + Unpin + Send + 'static,
         child: Option<Child>,
         call_timeout: Duration,
+        max_message_bytes: usize,
     ) -> Arc<Self> {
         let upstream = Arc::new(Self {
             name,
@@ -83,13 +138,16 @@ impl Upstream {
             pending: Arc::default(),
             next_id: AtomicU64::new(1),
             call_timeout,
+            closed: Arc::default(),
             _child: child,
         });
         tokio::spawn(read_loop(
             upstream.name.clone(),
             reader,
+            max_message_bytes,
             upstream.writer.clone(),
             upstream.pending.clone(),
+            upstream.closed.clone(),
         ));
         upstream
     }
@@ -120,6 +178,9 @@ impl Upstream {
     /// as `Ok(Err(error))` so it can be relayed verbatim.
     /// Fails if the server does not answer within its call timeout.
     pub async fn request_raw(&self, method: &str, params: Value) -> Result<Result<Value, Value>> {
+        if self.closed.load(Ordering::Acquire) {
+            bail!("server {:?} is disconnected", self.name);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -167,12 +228,26 @@ pub(crate) async fn write_line(writer: &Writer, msg: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn read_loop(name: String, reader: impl AsyncRead + Unpin, writer: Writer, pending: Pending) {
-    let mut lines = BufReader::new(reader).lines();
+async fn read_loop(
+    name: String,
+    reader: impl AsyncRead + Unpin,
+    max_message_bytes: usize,
+    writer: Writer,
+    pending: Pending,
+    closed: Arc<AtomicBool>,
+) {
+    let mut reader = BufReader::new(reader);
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
+        let line = match read_line_limited(&mut reader, max_message_bytes).await {
+            Ok(Line::Text(line)) => line,
+            Ok(Line::Eof) => break,
+            Ok(Line::TooLong(n)) => {
+                // A server that floods us is not trusted to stay in sync.
+                eprintln!(
+                    "aegis: {name:?} sent a {n}-byte message (limit {max_message_bytes}); disconnecting it"
+                );
+                break;
+            }
             Err(e) => {
                 eprintln!("aegis: reading from {name:?}: {e}");
                 break;
@@ -216,6 +291,32 @@ async fn read_loop(name: String, reader: impl AsyncRead + Unpin, writer: Writer,
             (_, None) => {}
         }
     }
-    // Dropping the senders fails every in-flight request.
+    // Dropping the senders fails every in-flight request, and later ones
+    // fail straight away.
+    closed.store(true, Ordering::Release);
     pending.lock().await.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn lines(input: &[u8], max: usize) -> Vec<String> {
+        // A tiny buffer forces lines to arrive in several chunks.
+        let mut reader = BufReader::with_capacity(4, input);
+        let mut out = Vec::new();
+        loop {
+            match read_line_limited(&mut reader, max).await.unwrap() {
+                Line::Text(t) => out.push(t),
+                Line::TooLong(n) => out.push(format!("<too long: {n}>")),
+                Line::Eof => return out,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn long_lines_are_dropped_whole() {
+        let got = lines(b"short\n0123456789abcdef\nok\ntail", 8).await;
+        assert_eq!(got, ["short", "<too long: 16>", "ok", "tail"]);
+    }
 }

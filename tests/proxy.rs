@@ -4,17 +4,19 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aegis::audit::{self, AuditLog, Event};
+use aegis::audit::{self, ArgumentLogging, AuditLog, Event};
 use aegis::config::Config;
 use aegis::policy::Action;
-use aegis::proxy::{self, Proxy};
-use aegis::upstream::{DEFAULT_CALL_TIMEOUT, Upstream};
+use aegis::proxy::{self, Options, Proxy};
+use aegis::resources::ResourceStore;
+use aegis::upstream::{DEFAULT_CALL_TIMEOUT, DEFAULT_MAX_MESSAGE_BYTES, Upstream};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex};
+use tokio::task::JoinHandle;
 
-/// A minimal MCP server exposing one tool that echoes its arguments. A mute
-/// server completes the handshake and then never answers again.
-async fn fake_server(stream: DuplexStream, tool: &'static str, mute: bool) {
+/// A minimal MCP server whose tools echo their arguments. A mute server
+/// completes the handshake and then never answers again.
+async fn fake_server(stream: DuplexStream, tools: &'static [&'static str], mute: bool) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -29,15 +31,16 @@ async fn fake_server(stream: DuplexStream, tool: &'static str, mute: bool) {
             "initialize" => json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": tool, "version": "0" },
+                "serverInfo": { "name": "fake", "version": "0" },
             }),
-            "tools/list" => {
-                json!({ "tools": [{ "name": tool, "inputSchema": { "type": "object" } }] })
-            }
+            "tools/list" => json!({
+                "tools": tools.iter().map(|t| json!({ "name": t, "inputSchema": { "type": "object" } })).collect::<Vec<_>>()
+            }),
             "tools/call" => {
-                assert_eq!(
-                    msg["params"]["name"], tool,
-                    "aegis must strip the namespace"
+                let name = msg["params"]["name"].as_str().unwrap();
+                assert!(
+                    tools.contains(&name),
+                    "aegis must strip the namespace, got {name}"
                 );
                 json!({ "content": [{ "type": "text", "text": msg["params"]["arguments"].to_string() }] })
             }
@@ -50,46 +53,114 @@ async fn fake_server(stream: DuplexStream, tool: &'static str, mute: bool) {
     }
 }
 
-async fn upstream(name: &str, tool: &'static str) -> Arc<Upstream> {
-    connect(name, tool, false, DEFAULT_CALL_TIMEOUT).await
+async fn upstream(name: &str, tools: &'static [&'static str]) -> Arc<Upstream> {
+    connect(name, tools, false, DEFAULT_CALL_TIMEOUT).await
 }
 
-async fn connect(name: &str, tool: &'static str, mute: bool, timeout: Duration) -> Arc<Upstream> {
+async fn connect(
+    name: &str,
+    tools: &'static [&'static str],
+    mute: bool,
+    timeout: Duration,
+) -> Arc<Upstream> {
     let (ours, theirs) = duplex(64 * 1024);
-    tokio::spawn(fake_server(theirs, tool, mute));
+    tokio::spawn(fake_server(theirs, tools, mute));
     let (reader, writer) = tokio::io::split(ours);
-    let upstream = Upstream::connect(name.into(), reader, writer, None, timeout);
+    let upstream = Upstream::connect(
+        name.into(),
+        reader,
+        writer,
+        None,
+        timeout,
+        DEFAULT_MAX_MESSAGE_BYTES,
+    );
     upstream.initialize().await.unwrap();
     upstream
 }
 
+/// The agent's side of the connection. Answers approval prompts with
+/// `approve` (or with an error when `None`).
 struct Agent {
     lines: Lines<BufReader<tokio::io::ReadHalf<DuplexStream>>>,
     writer: tokio::io::WriteHalf<DuplexStream>,
     next_id: u64,
+    approve: Option<bool>,
+    prompts: Vec<String>,
 }
 
 impl Agent {
-    async fn request(&mut self, method: &str, params: Value) -> Value {
-        self.next_id += 1;
-        let msg =
-            json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
-        let mut out = serde_json::to_vec(&msg).unwrap();
+    async fn send(&mut self, msg: &Value) {
+        let mut out = serde_json::to_vec(msg).unwrap();
         out.push(b'\n');
         self.writer.write_all(&out).await.unwrap();
-        let reply: Value =
-            serde_json::from_str(&self.lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(reply["id"], self.next_id);
-        reply
     }
 
-    async fn call(&mut self, tool: &str) -> Value {
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await;
+        loop {
+            let msg: Value =
+                serde_json::from_str(&self.lines.next_line().await.unwrap().unwrap()).unwrap();
+            if msg["method"] == "elicitation/create" {
+                self.prompts
+                    .push(msg["params"]["message"].as_str().unwrap().to_string());
+                let reply = match self.approve {
+                    Some(yes) => json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {
+                        "action": "accept", "content": { "approve": yes } } }),
+                    None => json!({ "jsonrpc": "2.0", "id": msg["id"], "error": {
+                        "code": -32601, "message": "unsupported" } }),
+                };
+                self.send(&reply).await;
+                continue;
+            }
+            assert_eq!(msg["id"], id);
+            return msg;
+        }
+    }
+
+    async fn call(&mut self, tool: &str, arguments: Value) -> Value {
         self.request(
             "tools/call",
-            json!({ "name": tool, "arguments": { "x": 1 } }),
+            json!({ "name": tool, "arguments": arguments }),
         )
         .await
     }
+
+    async fn initialize(&mut self, can_ask: bool) {
+        let capabilities = if can_ask {
+            json!({ "elicitation": {} })
+        } else {
+            json!({})
+        };
+        let init = self
+            .request(
+                "initialize",
+                json!({ "protocolVersion": "2025-06-18", "capabilities": capabilities }),
+            )
+            .await;
+        assert_eq!(init["result"]["serverInfo"]["name"], "aegis");
+    }
+}
+
+fn text(reply: &Value) -> &str {
+    reply["result"]["content"][0]["text"].as_str().unwrap()
+}
+
+fn start(proxy: Arc<Proxy>) -> (Agent, JoinHandle<anyhow::Result<()>>) {
+    let (agent_side, proxy_side) = duplex(64 * 1024);
+    let (pr, pw) = tokio::io::split(proxy_side);
+    let served = tokio::spawn(proxy.serve(pr, pw));
+    let (ar, aw) = tokio::io::split(agent_side);
+    let agent = Agent {
+        lines: BufReader::new(ar).lines(),
+        writer: aw,
+        next_id: 0,
+        approve: None,
+        prompts: Vec::new(),
+    };
+    (agent, served)
 }
 
 #[tokio::test]
@@ -116,30 +187,16 @@ async fn untrusted_read_blocks_later_shell_call() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("audit.jsonl");
     let upstreams = vec![
-        upstream("web", "fetch").await,
-        upstream("shell", "exec").await,
+        upstream("web", &["fetch"]).await,
+        upstream("shell", &["exec"]).await,
     ];
-    let proxy = Proxy::new(
-        upstreams,
-        config.policy(),
-        Some(AuditLog::open(&log_path, None).unwrap()),
-    )
-    .unwrap();
-
-    let (agent_side, proxy_side) = duplex(64 * 1024);
-    let (pr, pw) = tokio::io::split(proxy_side);
-    let served = tokio::spawn(proxy.clone().serve(pr, pw));
-    let (ar, aw) = tokio::io::split(agent_side);
-    let mut agent = Agent {
-        lines: BufReader::new(ar).lines(),
-        writer: aw,
-        next_id: 0,
+    let options = Options {
+        audit: Some(AuditLog::open(&log_path, None).unwrap()),
+        ..Options::default()
     };
-
-    let init = agent
-        .request("initialize", json!({ "protocolVersion": "2025-06-18" }))
-        .await;
-    assert_eq!(init["result"]["serverInfo"]["name"], "aegis");
+    let proxy = Proxy::new(upstreams, config.policy(), options).unwrap();
+    let (mut agent, served) = start(proxy.clone());
+    agent.initialize(false).await;
 
     let list = agent.request("tools/list", json!({})).await;
     let names: Vec<_> = list["result"]["tools"]
@@ -151,24 +208,24 @@ async fn untrusted_read_blocks_later_shell_call() {
     assert_eq!(names, [json!("web__fetch"), json!("shell__exec")]);
 
     // Clean context: shell runs.
-    let r = agent.call("shell__exec").await;
-    assert_eq!(r["result"]["content"][0]["text"], r#"{"x":1}"#);
+    let r = agent.call("shell__exec", json!({ "x": 1 })).await;
+    assert_eq!(text(&r), r#"{"x":1}"#);
 
     // Read untrusted content.
-    let r = agent.call("web__fetch").await;
+    let r = agent.call("web__fetch", json!({ "x": 1 })).await;
     assert!(r["result"]["isError"].is_null());
 
     // Now shell is blocked, with an explanation the model can read.
-    let r = agent.call("shell__exec").await;
+    let r = agent.call("shell__exec", json!({ "x": 1 })).await;
     assert_eq!(r["result"]["isError"], true);
-    let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("untrusted") && text.contains("no shell after reading the web"),
-        "{text}"
+        text(&r).contains("untrusted") && text(&r).contains("no shell after reading the web"),
+        "{}",
+        text(&r)
     );
 
     // Unknown tools are rejected, not forwarded.
-    let r = agent.call("nope__x").await;
+    let r = agent.call("nope__x", json!({})).await;
     assert_eq!(r["error"]["code"], -32602);
 
     drop(agent);
@@ -200,8 +257,8 @@ async fn untrusted_read_blocks_later_shell_call() {
 async fn unresponsive_server_times_out_without_hiding_others() {
     let timeout = Duration::from_millis(200);
     let upstreams = vec![
-        connect("slow", "tool", true, timeout).await,
-        connect("web", "fetch", false, timeout).await,
+        connect("slow", &["tool"], true, timeout).await,
+        connect("web", &["fetch"], false, timeout).await,
     ];
 
     // Listing leaves the silent server out instead of failing entirely.
@@ -228,4 +285,277 @@ async fn unresponsive_server_times_out_without_hiding_others() {
         .request("tools/call", json!({ "name": "fetch", "arguments": {} }))
         .await
         .unwrap();
+}
+
+fn ask_policy() -> Config {
+    toml::from_str(
+        r#"
+        [[source]]
+        tool = "web__*"
+        labels = ["untrusted"]
+
+        [[rule]]
+        tool = "shell__*"
+        when_context_has = ["untrusted"]
+        action = "ask"
+        reason = "shell after reading the web needs a person's OK"
+        "#,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn ask_runs_the_call_only_when_a_person_approves() {
+    let upstreams = vec![
+        upstream("web", &["fetch"]).await,
+        upstream("shell", &["exec"]).await,
+    ];
+    let proxy = Proxy::new(upstreams, ask_policy().policy(), Options::default()).unwrap();
+    let (mut agent, _served) = start(proxy);
+    agent.initialize(true).await;
+    agent.call("web__fetch", json!({})).await;
+
+    // Approved: the call runs.
+    agent.approve = Some(true);
+    let r = agent
+        .call("shell__exec", json!({ "cmd": "ls", "token": "s3cret" }))
+        .await;
+    assert_eq!(text(&r), r#"{"cmd":"ls","token":"s3cret"}"#);
+    let prompt = &agent.prompts[0];
+    assert!(
+        prompt.contains("shell__exec") && prompt.contains("Rule #1"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("s3cret"),
+        "secrets must not be shown: {prompt}"
+    );
+
+    // Declined: a tool error, and the server is never called.
+    agent.approve = Some(false);
+    let r = agent.call("shell__exec", json!({ "cmd": "ls" })).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("not approved"), "{}", text(&r));
+
+    // The client refuses to show prompts: denied.
+    agent.approve = None;
+    let r = agent.call("shell__exec", json!({ "cmd": "ls" })).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(agent.prompts.len(), 3);
+}
+
+#[tokio::test]
+async fn ask_is_denied_when_the_client_cannot_ask() {
+    let upstreams = vec![
+        upstream("web", &["fetch"]).await,
+        upstream("shell", &["exec"]).await,
+    ];
+    let proxy = Proxy::new(upstreams, ask_policy().policy(), Options::default()).unwrap();
+    let (mut agent, _served) = start(proxy);
+    agent.initialize(false).await; // no elicitation capability
+    agent.approve = Some(true); // would approve, but is never asked
+    agent.call("web__fetch", json!({})).await;
+    let r = agent.call("shell__exec", json!({ "cmd": "ls" })).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("cannot ask"), "{}", text(&r));
+    assert!(agent.prompts.is_empty());
+}
+
+#[tokio::test]
+async fn ask_times_out_to_a_denial() {
+    let upstreams = vec![
+        upstream("web", &["fetch"]).await,
+        upstream("shell", &["exec"]).await,
+    ];
+    let options = Options {
+        approval_timeout: Duration::from_millis(150),
+        ..Options::default()
+    };
+    let proxy = Proxy::new(upstreams, ask_policy().policy(), options).unwrap();
+    let (agent_side, proxy_side) = duplex(64 * 1024);
+    let (pr, pw) = tokio::io::split(proxy_side);
+    tokio::spawn(proxy.serve(pr, pw));
+    let (ar, mut aw) = tokio::io::split(agent_side);
+    let mut lines = BufReader::new(ar).lines();
+    for (id, msg) in [
+        (
+            1,
+            json!({ "method": "initialize", "params": { "capabilities": { "elicitation": {} } } }),
+        ),
+        (
+            2,
+            json!({ "method": "tools/call", "params": { "name": "web__fetch", "arguments": {} } }),
+        ),
+        (
+            3,
+            json!({ "method": "tools/call", "params": { "name": "shell__exec", "arguments": {} } }),
+        ),
+    ] {
+        let mut msg = msg;
+        msg["jsonrpc"] = json!("2.0");
+        msg["id"] = json!(id);
+        let mut out = serde_json::to_vec(&msg).unwrap();
+        out.push(b'\n');
+        aw.write_all(&out).await.unwrap();
+        // Read until this request's reply, ignoring (not answering) prompts.
+        loop {
+            let reply: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if reply["id"] == id {
+                if id == 3 {
+                    assert!(
+                        reply["result"]["content"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("nobody answered in time")
+                    );
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// A fresh aegis (a new session) over web, files and shell servers.
+async fn files_session(config: &Config, state: &std::path::Path) -> Agent {
+    let upstreams = vec![
+        upstream("web", &["fetch"]).await,
+        upstream("files", &["write_file", "read_file"]).await,
+        upstream("shell", &["exec"]).await,
+    ];
+    let options = Options {
+        resources: Some(ResourceStore::open(state, config.resources.clone()).unwrap()),
+        ..Options::default()
+    };
+    let proxy = Proxy::new(upstreams, config.policy(), options).unwrap();
+    let (mut agent, _served) = start(proxy);
+    agent.initialize(false).await;
+    agent
+}
+
+#[tokio::test]
+async fn file_written_while_untrusted_stays_untrusted_next_session() {
+    let config: Config = toml::from_str(
+        r#"
+        [[source]]
+        tool = "web__*"
+        labels = ["untrusted"]
+
+        [[source]]
+        tool = "files__*"
+        labels = []
+
+        [[resource]]
+        write = "files__write_file"
+        read = "files__read_file"
+        key = "path"
+
+        [[rule]]
+        tool = "shell__*"
+        when_context_has = ["untrusted"]
+        action = "deny"
+        "#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.json");
+
+    // Session 1 reads the web, then writes what it read into the repo.
+    let mut agent = files_session(&config, &state).await;
+    agent
+        .call("web__fetch", json!({ "url": "https://evil.example" }))
+        .await;
+    agent
+        .call(
+            "files__write_file",
+            json!({ "path": "src/login.tsx", "content": "..." }),
+        )
+        .await;
+    drop(agent);
+
+    // Session 2 starts clean, and a trusted read of an untouched file keeps it clean.
+    let mut agent = files_session(&config, &state).await;
+    agent
+        .call("files__read_file", json!({ "path": "README.md" }))
+        .await;
+    let r = agent
+        .call("shell__exec", json!({ "cmd": "npm test" }))
+        .await;
+    assert!(r["result"]["isError"].is_null(), "{r}");
+
+    // Reading the file session 1 wrote (spelled differently) brings the label back.
+    agent
+        .call(
+            "files__read_file",
+            json!({ "path": "./src/x/../login.tsx" }),
+        )
+        .await;
+    let r = agent
+        .call("shell__exec", json!({ "cmd": "npm test" }))
+        .await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+}
+
+#[tokio::test]
+async fn oversized_agent_message_is_rejected_and_the_connection_survives() {
+    let upstreams = vec![upstream("web", &["fetch"]).await];
+    let options = Options {
+        max_message_bytes: 2048,
+        ..Options::default()
+    };
+    let proxy = Proxy::new(
+        upstreams,
+        toml::from_str::<Config>("").unwrap().policy(),
+        options,
+    )
+    .unwrap();
+    let (mut agent, _served) = start(proxy);
+    agent.initialize(false).await;
+
+    let huge = json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": { "name": "web__fetch", "arguments": { "blob": "x".repeat(10_000) } } });
+    agent.send(&huge).await;
+    let reply: Value =
+        serde_json::from_str(&agent.lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(reply["error"]["code"], -32600);
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds")
+    );
+
+    let r = agent.call("web__fetch", json!({ "url": "ok" })).await;
+    assert!(r["result"]["isError"].is_null());
+}
+
+#[tokio::test]
+async fn secrets_in_arguments_are_redacted_in_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let upstreams = vec![upstream("web", &["fetch"]).await];
+    let options = Options {
+        audit: Some(AuditLog::open(&log_path, None).unwrap()),
+        arguments: ArgumentLogging::Redacted,
+        ..Options::default()
+    };
+    let proxy = Proxy::new(
+        upstreams,
+        toml::from_str::<Config>("").unwrap().policy(),
+        options,
+    )
+    .unwrap();
+    let (mut agent, _served) = start(proxy);
+    agent.initialize(false).await;
+    let r = agent
+        .call(
+            "web__fetch",
+            json!({ "url": "https://api.example", "headers": { "Authorization": "Bearer abc" } }),
+        )
+        .await;
+    // The server still gets the real value; only the log is redacted.
+    assert!(text(&r).contains("Bearer abc"));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(!log.contains("Bearer abc"), "{log}");
+    assert!(log.contains("[redacted]") && log.contains("https://api.example"));
 }

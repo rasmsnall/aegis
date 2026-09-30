@@ -5,4 +5,6 @@ import { defineConfig } from "vite";
 export default defineConfig({
   base: "./",
   plugins: [react()],
+  // Top-level await loads the policy engine before the first render.
+  build: { target: "es2022" },
 });

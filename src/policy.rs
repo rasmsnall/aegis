@@ -23,11 +23,23 @@ use crate::labels::{LabelSet, glob_match};
 pub enum Action {
     Allow,
     Deny,
+    /// Run the call only if a person approves it.
+    Ask,
+}
+
+impl Action {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Allow => "allow",
+            Action::Deny => "deny",
+            Action::Ask => "ask",
+        }
+    }
 }
 
 /// Labels attached to the output of every tool matching `tool`. Empty
 /// `labels` marks the output as trusted.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     pub tool: String,
@@ -35,7 +47,7 @@ pub struct Source {
 }
 
 /// A rule over tool calls. The first rule that matches a call decides it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Tool name pattern (`*` wildcards), e.g. `shell__*`.
@@ -50,9 +62,11 @@ pub struct Rule {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
+    #[serde(default)]
     pub sources: Vec<Source>,
+    #[serde(default)]
     pub rules: Vec<Rule>,
     pub default: Action,
     /// Labels for the output of tools that no source matches.
@@ -67,6 +81,45 @@ pub struct Decision {
     /// Context labels that triggered the rule.
     pub matched_labels: Vec<String>,
     pub reason: Option<String>,
+    /// For `ask`: whether a person approved the call. `None` until answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<bool>,
+}
+
+impl Decision {
+    /// Whether the call goes ahead: allowed outright, or asked and approved.
+    pub fn runs(&self) -> bool {
+        match self.action {
+            Action::Allow => true,
+            Action::Deny => false,
+            Action::Ask => self.approved == Some(true),
+        }
+    }
+
+    /// The tool error shown to the agent when the call does not run.
+    pub fn message(&self, tool: &str) -> String {
+        let rule = self
+            .rule
+            .map_or("the default policy".to_string(), |r| format!("rule #{r}"));
+        let because = if self.matched_labels.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " because this session has read data labelled {}",
+                self.matched_labels.join(", ")
+            )
+        };
+        let mut text = match self.action {
+            Action::Ask => format!(
+                "aegis did not run this call to {tool}: {rule} requires a person's approval{because}, and it was not approved"
+            ),
+            _ => format!("aegis blocked this call to {tool} ({rule}){because}"),
+        };
+        if let Some(reason) = &self.reason {
+            text += &format!(": {reason}");
+        }
+        text
+    }
 }
 
 impl Policy {
@@ -117,6 +170,7 @@ impl Policy {
                 rule: Some(i + 1),
                 matched_labels,
                 reason: rule.reason.clone(),
+                approved: None,
             };
         }
         Decision {
@@ -124,6 +178,7 @@ impl Policy {
             rule: None,
             matched_labels: Vec::new(),
             reason: None,
+            approved: None,
         }
     }
 }
@@ -149,8 +204,81 @@ impl Session {
             .collect()
     }
 
+    /// Adds labels from elsewhere (e.g. a file written in an earlier session).
+    /// Returns the ones that were new.
+    pub fn add_labels(&mut self, labels: impl IntoIterator<Item = String>) -> LabelSet {
+        labels
+            .into_iter()
+            .filter(|l| self.context.insert(l.clone()))
+            .collect()
+    }
+
     pub fn check_call(&self, policy: &Policy, tool: &str) -> Decision {
         policy.decide(tool, &self.context)
+    }
+}
+
+/// One call in a [`simulate`]d session.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimCall {
+    pub tool: String,
+    /// The person's answer if the policy asks about this call.
+    #[serde(default)]
+    pub approved: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimEntry {
+    pub tool: String,
+    pub decision: Decision,
+    /// Whether the call went ahead.
+    pub runs: bool,
+    /// Labels its output added to the context.
+    pub added: Vec<String>,
+    /// The tool error the agent saw, if the call did not run.
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Simulation {
+    pub entries: Vec<SimEntry>,
+    pub context: Vec<String>,
+}
+
+/// Runs a sequence of calls through `policy` from a clean session, exactly as
+/// the proxy would decide them. This is what the website's playground runs,
+/// compiled to WebAssembly.
+pub fn simulate(policy: &Policy, calls: &[SimCall]) -> Simulation {
+    let mut session = Session::default();
+    let entries = calls
+        .iter()
+        .map(|call| {
+            let mut decision = session.check_call(policy, &call.tool);
+            if decision.action == Action::Ask {
+                decision.approved = call.approved;
+            }
+            let runs = decision.runs();
+            let added = if runs {
+                session
+                    .observe_result(policy, &call.tool)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let message = (!runs).then(|| decision.message(&call.tool));
+            SimEntry {
+                tool: call.tool.clone(),
+                decision,
+                runs,
+                added,
+                message,
+            }
+        })
+        .collect();
+    Simulation {
+        entries,
+        context: session.context().iter().cloned().collect(),
     }
 }
 
@@ -209,6 +337,69 @@ mod tests {
 
         policy.default_labels.clear();
         assert!(policy.labels_for_result("mail__read").is_empty());
+    }
+
+    #[test]
+    fn ask_runs_only_when_approved() {
+        let mut policy = policy();
+        policy.rules[0].action = Action::Ask;
+        let mut session = Session::default();
+        session.observe_result(&policy, "web__fetch");
+        let mut d = session.check_call(&policy, "shell__exec");
+        assert_eq!(d.action, Action::Ask);
+        assert!(!d.runs());
+        assert!(d.message("shell__exec").contains("not approved"));
+        d.approved = Some(false);
+        assert!(!d.runs());
+        d.approved = Some(true);
+        assert!(d.runs());
+        assert!(!session.check_call(&policy, "danger__rm").runs());
+    }
+
+    #[test]
+    fn block_message_explains_itself() {
+        let policy = policy();
+        let mut session = Session::default();
+        session.observe_result(&policy, "web__fetch");
+        let text = session
+            .check_call(&policy, "shell__exec")
+            .message("shell__exec");
+        assert_eq!(
+            text,
+            "aegis blocked this call to shell__exec (rule #1) because this session has read data labelled untrusted: no shell after reading the web"
+        );
+    }
+
+    #[test]
+    fn simulate_matches_the_session_model() {
+        let mut policy = policy();
+        policy.rules[0].action = Action::Ask;
+        let calls = |approved| {
+            vec![
+                SimCall {
+                    tool: "web__fetch".into(),
+                    approved: None,
+                },
+                SimCall {
+                    tool: "shell__exec".into(),
+                    approved,
+                },
+            ]
+        };
+        let sim = simulate(&policy, &calls(Some(true)));
+        assert_eq!(sim.context, ["untrusted"]);
+        assert_eq!(sim.entries[0].added, ["untrusted"]);
+        assert!(sim.entries[1].runs && sim.entries[1].message.is_none());
+
+        let sim = simulate(&policy, &calls(None));
+        assert!(!sim.entries[1].runs);
+        assert!(
+            sim.entries[1]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("not approved")
+        );
     }
 
     #[test]

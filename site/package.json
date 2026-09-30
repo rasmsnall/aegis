@@ -4,10 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "wasm": "cargo build --release --lib --no-default-features --target wasm32-unknown-unknown --manifest-path ../Cargo.toml && mkdir -p public && cp ../target/wasm32-unknown-unknown/release/aegis.wasm public/aegis.wasm",
+    "dev": "npm run wasm && vite",
+    "build": "npm run wasm && tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/*.test.ts"
+    "test": "npm run wasm && node --experimental-strip-types --test src/*.test.ts"
   },
   "dependencies": {
     "react": "^19.3.0",

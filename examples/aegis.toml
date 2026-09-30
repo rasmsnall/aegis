@@ -9,6 +9,11 @@ path = "aegis-audit.jsonl"
 # of reach of the servers below (another user, or outside their sandbox), or
 # set AEGIS_AUDIT_KEY instead; aegis never passes that variable on to servers.
 # key_file = "/etc/aegis/audit.key"
+# Tool arguments are logged with secrets (tokens, passwords, API keys,
+# credential-looking values) replaced by "[redacted]". Other modes: "full",
+# "hash" (only a SHA-256), "omit".
+arguments = "redacted"
+# redact_keys = ["customer_id"]   # extra argument names to redact
 
 [policy]
 # What happens to a tool call no rule matches.
@@ -66,11 +71,15 @@ when_context_has = ["untrusted"]
 action = "deny"
 reason = "shell commands are disabled once untrusted content is in context"
 
+# "ask" shows the person using the agent an approval prompt (through the MCP
+# client's elicitation support). The model cannot see or answer it. With no
+# answer within [approval].timeout_secs, or a client that can't ask, the call
+# is denied.
 [[rule]]
 tool = "github__push_files"
 when_context_has = ["untrusted"]
-action = "deny"
-reason = "pushing is disabled once untrusted content is in context"
+action = "ask"
+reason = "pushing after reading untrusted content needs a person's OK"
 
 [[rule]]
 tool = "github__create_or_update_file"
@@ -82,3 +91,25 @@ reason = "writing files is disabled once untrusted content is in context"
 tool = "github__delete_*"
 action = "deny"
 reason = "deletion is never allowed through this agent"
+
+[approval]
+timeout_secs = 300
+
+# --- Labels that outlive a session ---------------------------------------
+# A session holding untrusted data could write it into a file that a later,
+# clean session reads through a trusted tool. For tools listed here, a write
+# made while the session holds labels stores them against the file (in
+# [state].path), and any later read of that file brings them back.
+
+[[resource]]
+write = "github__create_or_update_file"
+read = "github__get_file_contents"
+key = "path"
+
+[state]
+path = "aegis-state.json"
+
+[limits]
+# Largest single message accepted from the agent or a server. A server that
+# exceeds it is disconnected; an oversized agent message gets an error.
+max_message_bytes = 16777216

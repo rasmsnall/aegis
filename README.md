@@ -74,15 +74,49 @@ labels = []
 [[rule]]                   # first matching rule decides; else [policy].default
 tool = "shell__*"
 when_context_has = ["untrusted"]
-action = "deny"
+action = "deny"             # or "allow", or "ask" a person
 reason = "shell commands are disabled once untrusted content is in context"
 ```
+
+### Asking a person
+
+`action = "ask"` pauses the call and asks the person using the agent, through
+the MCP client's elicitation support (the host shows an approval prompt). The
+model never sees the prompt and cannot answer it. The prompt shows the call
+with secrets redacted and the rule that asked. If the client can't show
+prompts, or nobody answers within `[approval].timeout_secs` (default 300), the
+call is denied. Either way the answer is recorded in the audit log.
+
+### Labels that outlive a session
+
+Session labels are gone once aegis restarts. That leaves a gap: a session that
+read untrusted data could write it into a file, and a later, clean session
+could read the file back through a trusted tool. `[[resource]]` entries close
+it:
+
+```toml
+[[resource]]
+write = "files__write_file"  # tools that write the resource
+read = "files__read_file"    # tools that read it
+key = "path"                 # the argument naming it (a.b for nested)
+```
+
+A write that runs while the session holds labels stores them against that
+path in `[state].path` (default `aegis-state.json`). Any later read of the path
+brings them back, so the shell stays blocked in the next session too. Paths are
+compared after normalization (`src/./x/../a` is `src/a`); use `kind = "exact"`
+for identifiers that aren't paths. Symlinks, hard links and case-insensitive
+filesystems can still give one file two names, and writes through tools not
+listed (a shell, say) aren't seen, so keep those behind a rule as well.
 
 Server names may contain only letters, digits and `-`, so the first `__` in an
 exposed tool name always ends the server name. Each server takes
 `startup_timeout_secs` (default 30) and `call_timeout_secs` (default 300); a
 server that doesn't answer in time fails that request instead of hanging the
 agent, and one that can't list its tools is left out of the listing.
+`[limits].max_message_bytes` (default 16 MiB) caps every message: an oversized
+message from the agent gets an error, and a server that sends one is
+disconnected.
 
 ## Audit log
 
@@ -101,6 +135,13 @@ launches, but a key file those servers can read (same user, same filesystem)
 gives no protection. Deleting the whole log is still possible; ship it off
 the machine if you need to rule that out.
 
+Tool arguments are logged according to `[audit].arguments`. The default,
+`redacted`, replaces values whose argument names look like secrets (`token`,
+`password`, `api_key`, `Authorization`, ...) or whose values look like
+credentials (`Bearer ...`, `ghp_...`, `sk-...`, private keys) with
+`"[redacted]"`. Add names with `redact_keys`. `hash` keeps only a SHA-256 of
+the arguments, `omit` drops them, and `full` keeps them as sent.
+
 ## Semantics and limits
 
 - **Session-level taint.** Labels apply to the whole session, not to
@@ -110,22 +151,26 @@ the machine if you need to rule that out.
 - **Concurrent calls.** A call is checked against the labels present when it
   arrives. A call sent before an earlier call's result came back can't have
   been influenced by that result, so that result doesn't block it.
-- **Labels follow tools, not data.** If one session writes untrusted text to
-  a file and a later session reads that file through a trusted tool, the
-  second session doesn't know. Keep file-writing tools behind a rule, or
-  label file reads untrusted.
+- **Across sessions, labels follow declared resources.** Files written through
+  the tools in `[[resource]]` keep their labels; writes by other means (a
+  shell, another program) are invisible to aegis.
 - **Replay** recomputes labels from the log. A call the recording blocked but
-  the new policy allows is assumed to have returned output.
-- **Not yet supported:** resources and prompts (only tools are proxied),
-  server-to-client requests (sampling and elicitation are refused), HTTP
-  transport, human approval as a third action, labels based on arguments
-  (e.g. trust by URL domain), and OS-level enforcement so tools can't
-  get around the proxy.
+  the new policy allows is assumed to have returned output, and a call the new
+  policy would `ask` about is assumed approved (which can only add taint).
+- **Not yet supported:** MCP resources and prompts (only tools are proxied),
+  server-to-client requests from upstream servers (their sampling and
+  elicitation requests are refused), HTTP transport, labels based on
+  arguments (e.g. trust by URL domain), and OS-level enforcement so tools
+  can't get around the proxy.
 
 ## Website
 
-`site/` is a TypeScript/React (Vite) site with an in-browser playground that
-runs the same policy rules. Run it with `cd site && npm install && npm run dev`.
+`site/` is a TypeScript/React (Vite) site. Its playground decides calls with
+aegis's own policy engine (`src/policy.rs`), compiled to WebAssembly by
+`npm run wasm`, so what you see there is what the proxy does. Building it needs
+Rust with the `wasm32-unknown-unknown` target
+(`rustup target add wasm32-unknown-unknown`); then run
+`cd site && npm install && npm run dev`.
 
 ## License
 

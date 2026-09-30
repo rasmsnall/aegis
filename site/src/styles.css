@@ -491,6 +491,34 @@ main > section:not(.hero) { padding-top: 128px; }
   .issue-flag, .tool.sending, .wire-text, .wire-bar.live::after, .wire-idle::after, .log li, .log li.denied, .log li.harmed, .chip, .bump { animation: none; }
 }
 
+/* Approval prompt: aegis asking the person, not the agent. */
+.wire-asking { border-color: var(--fg-2); }
+.approval {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 14px;
+  background: var(--surface-2);
+  border-left: 4px solid var(--fg);
+  animation: entry-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.approval p { line-height: 1.5; }
+.approval-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.approval-actions .btn { padding: 10px 16px; }
+.badge-ask { color: var(--fg); }
+.policy-rule { cursor: default; }
+.action-select {
+  font: 600 0.82rem var(--mono);
+  color: var(--fg);
+  background: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.action-select:focus-visible { outline: 2px solid var(--scarlet); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .approval { animation: none; } }
+
 .pg-toml { margin-top: 16px; border: 1px solid var(--line); background: var(--surface); }
 .pg-toml pre { max-height: 320px; }
 

@@ -31,6 +31,97 @@ const GENESIS: &str = "000000000000000000000000000000000000000000000000000000000
 /// Environment variable holding the audit key (alternative to a key file).
 pub const KEY_ENV: &str = "AEGIS_AUDIT_KEY";
 
+/// How tool call arguments are written to the log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArgumentLogging {
+    /// As sent.
+    Full,
+    /// With values that look like secrets replaced by `"[redacted]"`.
+    #[default]
+    Redacted,
+    /// Only a SHA-256 of the arguments, enough to tell calls apart.
+    Hash,
+    /// Not at all.
+    Omit,
+}
+
+/// Argument names redacted wherever they appear (matched case-insensitively,
+/// as substrings: `github_token` and `X-Api-Key` both match).
+const SECRET_KEYS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "passphrase",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "cookie",
+    "credential",
+    "private_key",
+    "privatekey",
+    "signature",
+];
+
+/// Value prefixes of well-known credential formats.
+const SECRET_PREFIXES: &[&str] = &[
+    "Bearer ",
+    "Basic ",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "-----BEGIN",
+];
+
+/// Renders `arguments` for the log according to `mode`.
+pub fn log_arguments(
+    mode: ArgumentLogging,
+    arguments: &serde_json::Value,
+    extra_keys: &[String],
+) -> serde_json::Value {
+    use serde_json::Value;
+    fn redact(v: &Value, extra: &[String]) -> Value {
+        match v {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, v)| {
+                        let lower = k.to_ascii_lowercase();
+                        let secret = SECRET_KEYS.iter().any(|s| lower.contains(s))
+                            || extra.iter().any(|e| e.eq_ignore_ascii_case(k));
+                        let v = if secret {
+                            Value::String("[redacted]".into())
+                        } else {
+                            redact(v, extra)
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(|v| redact(v, extra)).collect()),
+            Value::String(s) if SECRET_PREFIXES.iter().any(|p| s.starts_with(p)) => {
+                Value::String("[redacted]".into())
+            }
+            other => other.clone(),
+        }
+    }
+    match mode {
+        ArgumentLogging::Full => arguments.clone(),
+        ArgumentLogging::Redacted => redact(arguments, extra_keys),
+        ArgumentLogging::Hash => {
+            let digest = Sha256::digest(arguments.to_string().as_bytes());
+            serde_json::json!({ "sha256": hex::encode(digest) })
+        }
+        ArgumentLogging::Omit => Value::Null,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
@@ -49,6 +140,10 @@ pub enum Event {
         tool: String,
         is_error: bool,
         added: Vec<String>,
+        /// Labels recalled for the resource the tool read (a file written
+        /// while an earlier session held those labels).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        recalled: Vec<String>,
     },
     /// aegis shut down cleanly.
     SessionEnd,
@@ -271,6 +366,7 @@ mod tests {
             tool: "web__fetch".into(),
             is_error: false,
             added: vec!["untrusted".into()],
+            recalled: vec![],
         })
         .unwrap();
         log.record(Event::SessionEnd).unwrap();
@@ -378,6 +474,40 @@ mod tests {
                 .unfinished
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn redacts_secrets_in_arguments() {
+        let args = serde_json::json!({
+            "url": "https://example.com",
+            "headers": { "Authorization": "x", "X-Api-Key": "y", "Accept": "text/html" },
+            "github_token": "abc",
+            "note": "ghp_0123456789",
+            "items": [{ "password": "p" }, "Bearer abc"],
+            "customer_id": "c-1",
+            "author": "Ada",
+        });
+        let logged = log_arguments(ArgumentLogging::Redacted, &args, &["customer_id".into()]);
+        assert_eq!(
+            logged,
+            serde_json::json!({
+                "url": "https://example.com",
+                "headers": { "Authorization": "[redacted]", "X-Api-Key": "[redacted]", "Accept": "text/html" },
+                "github_token": "[redacted]",
+                "note": "[redacted]",
+                "items": [{ "password": "[redacted]" }, "[redacted]"],
+                "customer_id": "[redacted]",
+                "author": "Ada",
+            })
+        );
+        assert_eq!(log_arguments(ArgumentLogging::Full, &args, &[]), args);
+        assert_eq!(
+            log_arguments(ArgumentLogging::Omit, &args, &[]),
+            serde_json::Value::Null
+        );
+        let hashed = log_arguments(ArgumentLogging::Hash, &args, &[]);
+        assert_eq!(hashed["sha256"].as_str().unwrap().len(), 64);
+        assert!(!hashed.to_string().contains("abc"));
     }
 
     #[test]

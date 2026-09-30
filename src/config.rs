@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::audit::ArgumentLogging;
 use crate::policy::{Action, Rule, Source};
+use crate::resources::ResourceRule;
 
 /// Separator between a server name and its tool name in the tool names aegis
 /// exposes to the agent: tool `exec` on server `shell` becomes `shell__exec`.
@@ -25,6 +27,75 @@ pub struct Config {
     pub sources: Vec<Source>,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
+    #[serde(default, rename = "resource")]
+    pub resources: Vec<ResourceRule>,
+    #[serde(default)]
+    pub state: StateConfig,
+    #[serde(default)]
+    pub approval: ApprovalConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// Where labels that outlive a session (see `[[resource]]`) are kept.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    #[serde(default = "default_state_path")]
+    pub path: PathBuf,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            path: default_state_path(),
+        }
+    }
+}
+
+fn default_state_path() -> PathBuf {
+    PathBuf::from("aegis-state.json")
+}
+
+/// How `action = "ask"` asks a person.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// How long to wait for an answer before denying the call.
+    #[serde(default = "default_approval_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_approval_timeout(),
+        }
+    }
+}
+
+fn default_approval_timeout() -> u64 {
+    300
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Largest single JSON-RPC message accepted from the agent or a server.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: default_max_message_bytes(),
+        }
+    }
+}
+
+fn default_max_message_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +108,14 @@ pub struct AuditConfig {
     /// from `AEGIS_AUDIT_KEY`; with neither, the log is an unsigned chain.
     #[serde(default)]
     pub key_file: Option<PathBuf>,
+    /// How tool call arguments are logged: `redacted` (default) replaces
+    /// values that look like secrets, `hash` keeps only a SHA-256 of them,
+    /// `omit` drops them, `full` keeps them as sent.
+    #[serde(default)]
+    pub arguments: ArgumentLogging,
+    /// Extra argument names to redact, on top of the built-in list.
+    #[serde(default)]
+    pub redact_keys: Vec<String>,
 }
 
 impl Default for AuditConfig {
@@ -44,6 +123,8 @@ impl Default for AuditConfig {
         Self {
             path: default_audit_path(),
             key_file: None,
+            arguments: ArgumentLogging::default(),
+            redact_keys: Vec::new(),
         }
     }
 }
@@ -144,6 +225,21 @@ impl Config {
             }
             if !seen.insert(server.name.as_str()) {
                 bail!("duplicate server name {:?}", server.name);
+            }
+        }
+        if self.approval.timeout_secs == 0 {
+            bail!("[approval] timeout_secs must be at least 1 second");
+        }
+        if self.limits.max_message_bytes < 1024 {
+            bail!("[limits] max_message_bytes must be at least 1024");
+        }
+        for (i, r) in self.resources.iter().enumerate() {
+            if r.key.is_empty() || r.key.split('.').any(str::is_empty) {
+                bail!(
+                    "resource #{}: key {:?} is not a valid argument name",
+                    i + 1,
+                    r.key
+                );
             }
         }
         Ok(())

@@ -5,10 +5,21 @@
 //! tool calls that policy forbids given what the agent has already read —
 //! e.g. no shell commands after the agent has read a web page.
 
-pub mod audit;
-pub mod config;
 pub mod labels;
 pub mod policy;
+
+#[cfg(feature = "runtime")]
+pub mod audit;
+#[cfg(feature = "runtime")]
+pub mod config;
+#[cfg(feature = "runtime")]
 pub mod proxy;
+#[cfg(feature = "runtime")]
 pub mod replay;
+#[cfg(feature = "runtime")]
+pub mod resources;
+#[cfg(feature = "runtime")]
 pub mod upstream;
+
+#[cfg(target_arch = "wasm32")]
+mod wasm;

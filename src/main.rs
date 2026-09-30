@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -9,6 +10,7 @@ use aegis::config::Config;
 use aegis::policy::{Action, Policy};
 use aegis::proxy::{self, Proxy};
 use aegis::replay;
+use aegis::resources::ResourceStore;
 use aegis::upstream::Upstream;
 
 #[derive(Parser)]
@@ -76,11 +78,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let config = Config::load(&config)?;
             let key = AuditKey::load(config.audit.key_file.as_deref())?;
             let audit = AuditLog::open(&config.audit.path, key)?;
+            let resources = ResourceStore::open(&config.state.path, config.resources.clone())?;
             let mut upstreams = Vec::new();
             for server in &config.servers {
-                upstreams.push(Upstream::spawn(server).await?);
+                upstreams.push(Upstream::spawn(server, config.limits.max_message_bytes).await?);
             }
-            let proxy = Proxy::new(upstreams, config.policy(), Some(audit))?;
+            let options = proxy::Options {
+                audit: Some(audit),
+                arguments: config.audit.arguments,
+                redact_keys: config.audit.redact_keys.clone(),
+                resources: Some(resources),
+                approval_timeout: Duration::from_secs(config.approval.timeout_secs),
+                max_message_bytes: config.limits.max_message_bytes,
+            };
+            let proxy = Proxy::new(upstreams, config.policy(), options)?;
             proxy
                 .clone()
                 .serve(tokio::io::stdin(), tokio::io::stdout())
@@ -103,9 +114,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let key = AuditKey::load(key_file.as_deref())?;
             let report = audit::verify(&audit::read(&log)?, key.as_ref())?;
             println!(
-                "ok: {} entries in {} sessions, chain intact{}",
-                report.entries,
-                report.sessions,
+                "ok: {} in {}, chain intact{}",
+                plural(report.entries, "entry", "entries"),
+                plural(report.sessions, "session", "sessions"),
                 if report.signed {
                     ", signatures valid"
                 } else {
@@ -135,6 +146,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 let verb = match change.replayed.action {
                     Action::Allow => "now ALLOWED",
                     Action::Deny => "now DENIED ",
+                    Action::Ask => "now ASKS   ",
                 };
                 let rule = change
                     .replayed
@@ -160,7 +172,7 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     let mut warnings = Vec::new();
     let mut upstreams = Vec::new();
     for server in &config.servers {
-        match Upstream::spawn(server).await {
+        match Upstream::spawn(server, config.limits.max_message_bytes).await {
             Ok(u) => upstreams.push(u),
             Err(e) => warnings.push(format!("server {:?} did not start: {e:#}", server.name)),
         }
@@ -210,11 +222,10 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     for w in &warnings {
         println!("warning: {w}");
     }
-    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     println!(
         "{}, {}",
-        plural(names.len(), "tool"),
-        plural(warnings.len(), "warning")
+        plural(names.len(), "tool", "tools"),
+        plural(warnings.len(), "warning", "warnings")
     );
     Ok(if strict && !warnings.is_empty() {
         ExitCode::FAILURE
@@ -240,20 +251,14 @@ fn describe_labels(policy: &Policy, tool: &str) -> String {
 fn describe_rules(policy: &Policy, tool: &str) -> String {
     let rules = policy.rules_for(tool);
     if rules.is_empty() {
-        let default = match policy.default {
-            Action::Allow => "allow",
-            Action::Deny => "deny",
-        };
+        let default = policy.default.as_str();
         return format!("- (default: {default})");
     }
     rules
         .iter()
         .map(|&r| {
             let rule = &policy.rules[r - 1];
-            let action = match rule.action {
-                Action::Allow => "allow",
-                Action::Deny => "deny",
-            };
+            let action = rule.action.as_str();
             if rule.when_context_has.is_empty() {
                 format!("#{r} {action}")
             } else {
@@ -262,4 +267,8 @@ fn describe_rules(policy: &Policy, tool: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
