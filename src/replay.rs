@@ -63,6 +63,7 @@ pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
                     });
                 }
             }
+            Event::SessionEnd => {}
             Event::ToolResult { tool, .. } => {
                 if let Some(n) = suppressed.get_mut(tool.as_str()).filter(|n| **n > 0) {
                     *n -= 1;
@@ -86,6 +87,7 @@ mod tests {
             ts: 0,
             event,
             prev: String::new(),
+            signed: false,
             hash: String::new(),
         }
     }
@@ -142,6 +144,7 @@ mod tests {
                 reason: None,
             }],
             default: Action::Allow,
+            default_labels: vec![],
         };
         let report = replay(&log, &strict);
         assert_eq!(report.calls, 3);
@@ -168,6 +171,7 @@ mod tests {
                 reason: None,
             }],
             default: Action::Allow,
+            default_labels: vec![],
         };
         let report = replay(&log, &policy);
         // web__fetch is now allowed, so its output taints the later shell call.

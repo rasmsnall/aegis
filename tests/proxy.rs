@@ -1,18 +1,20 @@
-//! End-to-end: an agent talks to aegis, which fronts two in-process fake MCP
+//! End-to-end: an agent talks to aegis, which fronts in-process fake MCP
 //! servers. Reading from `web` must block a later call on `shell`.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aegis::audit::{self, AuditLog, Event};
 use aegis::config::Config;
 use aegis::policy::Action;
-use aegis::proxy::Proxy;
-use aegis::upstream::Upstream;
+use aegis::proxy::{self, Proxy};
+use aegis::upstream::{DEFAULT_CALL_TIMEOUT, Upstream};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex};
 
-/// A minimal MCP server exposing one tool that echoes its arguments.
-async fn fake_server(stream: DuplexStream, tool: &'static str) {
+/// A minimal MCP server exposing one tool that echoes its arguments. A mute
+/// server completes the handshake and then never answers again.
+async fn fake_server(stream: DuplexStream, tool: &'static str, mute: bool) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -20,6 +22,9 @@ async fn fake_server(stream: DuplexStream, tool: &'static str) {
         let Some(id) = msg.get("id").cloned() else {
             continue;
         };
+        if mute && msg["method"] != "initialize" {
+            continue;
+        }
         let result = match msg["method"].as_str().unwrap() {
             "initialize" => json!({
                 "protocolVersion": "2025-06-18",
@@ -46,10 +51,14 @@ async fn fake_server(stream: DuplexStream, tool: &'static str) {
 }
 
 async fn upstream(name: &str, tool: &'static str) -> Arc<Upstream> {
+    connect(name, tool, false, DEFAULT_CALL_TIMEOUT).await
+}
+
+async fn connect(name: &str, tool: &'static str, mute: bool, timeout: Duration) -> Arc<Upstream> {
     let (ours, theirs) = duplex(64 * 1024);
-    tokio::spawn(fake_server(theirs, tool));
+    tokio::spawn(fake_server(theirs, tool, mute));
     let (reader, writer) = tokio::io::split(ours);
-    let upstream = Upstream::connect(name.into(), reader, writer, None);
+    let upstream = Upstream::connect(name.into(), reader, writer, None, timeout);
     upstream.initialize().await.unwrap();
     upstream
 }
@@ -91,6 +100,10 @@ async fn untrusted_read_blocks_later_shell_call() {
         tool = "web__*"
         labels = ["untrusted"]
 
+        [[source]]
+        tool = "shell__*"
+        labels = []
+
         [[rule]]
         tool = "shell__*"
         when_context_has = ["untrusted"]
@@ -109,13 +122,13 @@ async fn untrusted_read_blocks_later_shell_call() {
     let proxy = Proxy::new(
         upstreams,
         config.policy(),
-        Some(AuditLog::open(&log_path).unwrap()),
+        Some(AuditLog::open(&log_path, None).unwrap()),
     )
     .unwrap();
 
     let (agent_side, proxy_side) = duplex(64 * 1024);
     let (pr, pw) = tokio::io::split(proxy_side);
-    let served = tokio::spawn(proxy.serve(pr, pw));
+    let served = tokio::spawn(proxy.clone().serve(pr, pw));
     let (ar, aw) = tokio::io::split(agent_side);
     let mut agent = Agent {
         lines: BufReader::new(ar).lines(),
@@ -160,10 +173,12 @@ async fn untrusted_read_blocks_later_shell_call() {
 
     drop(agent);
     served.await.unwrap().unwrap();
+    proxy.finish().await.unwrap();
 
-    // The audit log records the whole story and verifies.
+    // The audit log records the whole story, verifies, and ends cleanly.
     let entries = audit::read(&log_path).unwrap();
-    audit::verify(&entries).unwrap();
+    let report = audit::verify(&entries, None).unwrap();
+    assert!(report.unfinished.is_empty());
     let calls: Vec<_> = entries
         .iter()
         .filter_map(|e| match &e.event {
@@ -179,4 +194,38 @@ async fn untrusted_read_blocks_later_shell_call() {
             ("shell__exec", Action::Deny)
         ]
     );
+}
+
+#[tokio::test]
+async fn unresponsive_server_times_out_without_hiding_others() {
+    let timeout = Duration::from_millis(200);
+    let upstreams = vec![
+        connect("slow", "tool", true, timeout).await,
+        connect("web", "fetch", false, timeout).await,
+    ];
+
+    // Listing leaves the silent server out instead of failing entirely.
+    let listing = proxy::list_tools(&upstreams).await;
+    let names: Vec<_> = listing.tools.iter().map(|t| t["name"].clone()).collect();
+    assert_eq!(names, [json!("web__fetch")]);
+    assert_eq!(listing.failures.len(), 1);
+    assert!(listing.failures[0].1.to_string().contains("did not answer"));
+
+    // A call to it fails after the timeout rather than hanging.
+    let started = Instant::now();
+    let err = upstreams[0]
+        .request("tools/call", json!({ "name": "tool" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("did not answer tools/call"),
+        "{err}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // The healthy server keeps working.
+    upstreams[1]
+        .request("tools/call", json!({ "name": "fetch", "arguments": {} }))
+        .await
+        .unwrap();
 }

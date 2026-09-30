@@ -4,10 +4,10 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use aegis::audit::{self, AuditLog};
+use aegis::audit::{self, AuditKey, AuditLog};
 use aegis::config::Config;
-use aegis::policy::Action;
-use aegis::proxy::Proxy;
+use aegis::policy::{Action, Policy};
+use aegis::proxy::{self, Proxy};
 use aegis::replay;
 use aegis::upstream::Upstream;
 
@@ -25,19 +25,37 @@ enum Command {
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
     },
-    /// Validate a configuration file.
+    /// Validate a configuration file without starting any server.
     Check {
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
     },
-    /// Verify the hash chain of an audit log.
-    Verify { log: PathBuf },
+    /// Start the configured servers and show every tool with the labels its
+    /// output gets and the rules that apply to it. Warns about sources and
+    /// rules that match no tool, which usually means a typo.
+    Tools {
+        #[arg(short, long, default_value = "aegis.toml")]
+        config: PathBuf,
+        /// Exit with status 1 if there are any warnings.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Verify an audit log's chain (and signatures, given the key).
+    Verify {
+        log: PathBuf,
+        /// Key the log was signed with; defaults to AEGIS_AUDIT_KEY.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
     /// Show which recorded tool calls a policy would decide differently.
     Replay {
         log: PathBuf,
         /// Configuration whose sources and rules to replay against.
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
+        /// Key the log was signed with; defaults to AEGIS_AUDIT_KEY.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
 }
 
@@ -56,13 +74,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Run { config } => {
             let config = Config::load(&config)?;
-            let audit = AuditLog::open(&config.audit.path)?;
+            let key = AuditKey::load(config.audit.key_file.as_deref())?;
+            let audit = AuditLog::open(&config.audit.path, key)?;
             let mut upstreams = Vec::new();
             for server in &config.servers {
                 upstreams.push(Upstream::spawn(server).await?);
             }
             let proxy = Proxy::new(upstreams, config.policy(), Some(audit))?;
-            proxy.serve(tokio::io::stdin(), tokio::io::stdout()).await?;
+            proxy
+                .clone()
+                .serve(tokio::io::stdin(), tokio::io::stdout())
+                .await?;
+            proxy.finish().await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Check { config } => {
@@ -75,16 +98,36 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Verify { log } => {
-            let entries = audit::read(&log)?;
-            audit::verify(&entries)?;
-            println!("ok: {} entries, chain intact", entries.len());
+        Command::Tools { config, strict } => tools(&Config::load(&config)?, strict).await,
+        Command::Verify { log, key_file } => {
+            let key = AuditKey::load(key_file.as_deref())?;
+            let report = audit::verify(&audit::read(&log)?, key.as_ref())?;
+            println!(
+                "ok: {} entries in {} sessions, chain intact{}",
+                report.entries,
+                report.sessions,
+                if report.signed {
+                    ", signatures valid"
+                } else {
+                    " (unsigned: detects accidental damage only, not deliberate rewrites)"
+                }
+            );
+            for seq in &report.unfinished {
+                println!(
+                    "warning: session starting at entry {seq} has no session_end: aegis is still running, crashed, or the log was cut short"
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Replay { log, config } => {
+        Command::Replay {
+            log,
+            config,
+            key_file,
+        } => {
             let config = Config::load(&config)?;
             let entries = audit::read(&log)?;
-            if let Err(e) = audit::verify(&entries) {
+            let key = AuditKey::load(key_file.as_deref())?;
+            if let Err(e) = audit::verify(&entries, key.as_ref()) {
                 eprintln!("warning: audit log fails verification: {e}");
             }
             let report = replay::replay(&entries, &config.policy());
@@ -111,4 +154,112 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
     }
+}
+
+async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
+    let mut warnings = Vec::new();
+    let mut upstreams = Vec::new();
+    for server in &config.servers {
+        match Upstream::spawn(server).await {
+            Ok(u) => upstreams.push(u),
+            Err(e) => warnings.push(format!("server {:?} did not start: {e:#}", server.name)),
+        }
+    }
+    let listing = proxy::list_tools(&upstreams).await;
+    for (server, e) in &listing.failures {
+        warnings.push(format!("server {server:?} did not list its tools: {e:#}"));
+    }
+    let names: Vec<&str> = listing
+        .tools
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+
+    let policy = config.policy();
+    let width = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
+    println!("{:width$}  {:28}  RULES", "TOOL", "OUTPUT LABELS");
+    for name in &names {
+        println!(
+            "{name:width$}  {:28}  {}",
+            describe_labels(&policy, name),
+            describe_rules(&policy, name)
+        );
+    }
+
+    for (i, source) in policy.sources.iter().enumerate() {
+        if !names
+            .iter()
+            .any(|n| aegis::labels::glob_match(&source.tool, n))
+        {
+            warnings.push(format!(
+                "source #{} ({:?}) matches no tool",
+                i + 1,
+                source.tool
+            ));
+        }
+    }
+    for (i, rule) in policy.rules.iter().enumerate() {
+        if !names
+            .iter()
+            .any(|n| aegis::labels::glob_match(&rule.tool, n))
+        {
+            warnings.push(format!("rule #{} ({:?}) matches no tool", i + 1, rule.tool));
+        }
+    }
+    println!();
+    for w in &warnings {
+        println!("warning: {w}");
+    }
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    println!(
+        "{}, {}",
+        plural(names.len(), "tool"),
+        plural(warnings.len(), "warning")
+    );
+    Ok(if strict && !warnings.is_empty() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn describe_labels(policy: &Policy, tool: &str) -> String {
+    let labels: Vec<String> = policy.labels_for_result(tool).into_iter().collect();
+    let text = if labels.is_empty() {
+        "trusted".to_string()
+    } else {
+        labels.join(", ")
+    };
+    if policy.has_source_for(tool) {
+        text
+    } else {
+        format!("{text} (default)")
+    }
+}
+
+fn describe_rules(policy: &Policy, tool: &str) -> String {
+    let rules = policy.rules_for(tool);
+    if rules.is_empty() {
+        let default = match policy.default {
+            Action::Allow => "allow",
+            Action::Deny => "deny",
+        };
+        return format!("- (default: {default})");
+    }
+    rules
+        .iter()
+        .map(|&r| {
+            let rule = &policy.rules[r - 1];
+            let action = match rule.action {
+                Action::Allow => "allow",
+                Action::Deny => "deny",
+            };
+            if rule.when_context_has.is_empty() {
+                format!("#{r} {action}")
+            } else {
+                format!("#{r} {action} if {}", rule.when_context_has.join("|"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

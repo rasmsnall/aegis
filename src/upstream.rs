@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -16,6 +17,9 @@ use crate::config::ServerConfig;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Request timeout used when none is configured.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
@@ -24,6 +28,7 @@ pub struct Upstream {
     writer: Writer,
     pending: Pending,
     next_id: AtomicU64,
+    call_timeout: Duration,
     _child: Option<Child>,
 }
 
@@ -33,6 +38,8 @@ impl Upstream {
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .envs(&config.env)
+            // The audit key must stay out of reach of the agent's tools.
+            .env_remove(crate::audit::KEY_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -41,10 +48,23 @@ impl Upstream {
             .with_context(|| format!("starting server {:?} ({})", config.name, config.command))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        let upstream = Self::connect(config.name.clone(), stdout, stdin, Some(child));
-        upstream
-            .initialize()
+        let upstream = Self::connect(
+            config.name.clone(),
+            stdout,
+            stdin,
+            Some(child),
+            Duration::from_secs(config.call_timeout_secs),
+        );
+        let startup = Duration::from_secs(config.startup_timeout_secs);
+        tokio::time::timeout(startup, upstream.initialize())
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "server {:?} did not finish starting within {}s (raise startup_timeout_secs if it is just slow)",
+                    config.name,
+                    startup.as_secs()
+                )
+            })?
             .with_context(|| format!("initializing {:?}", config.name))?;
         Ok(upstream)
     }
@@ -55,12 +75,14 @@ impl Upstream {
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
         child: Option<Child>,
+        call_timeout: Duration,
     ) -> Arc<Self> {
         let upstream = Arc::new(Self {
             name,
             writer: Arc::new(Mutex::new(Box::new(writer))),
             pending: Arc::default(),
             next_id: AtomicU64::new(1),
+            call_timeout,
             _child: child,
         });
         tokio::spawn(read_loop(
@@ -96,18 +118,28 @@ impl Upstream {
 
     /// Like [`request`](Self::request) but hands back a JSON-RPC error object
     /// as `Ok(Err(error))` so it can be relayed verbatim.
+    /// Fails if the server does not answer within its call timeout.
     pub async fn request_raw(&self, method: &str, params: Value) -> Result<Result<Value, Value>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = write_line(&self.writer, &msg).await {
+        let exchange = async {
+            write_line(&self.writer, &msg).await?;
+            rx.await
+                .map_err(|_| anyhow!("server {:?} closed the connection", self.name))
+        };
+        let outcome = tokio::time::timeout(self.call_timeout, exchange).await;
+        if !matches!(outcome, Ok(Ok(_))) {
             self.pending.lock().await.remove(&id);
-            return Err(e);
         }
-        let mut response = rx
-            .await
-            .map_err(|_| anyhow!("server {:?} closed the connection", self.name))?;
+        let mut response = outcome.map_err(|_| {
+            anyhow!(
+                "server {:?} did not answer {method} within {}s",
+                self.name,
+                self.call_timeout.as_secs()
+            )
+        })??;
         if let Some(error) = response.get_mut("error") {
             return Ok(Err(error.take()));
         }

@@ -46,6 +46,12 @@ impl Proxy {
         Ok(proxy)
     }
 
+    /// Records a clean shutdown. Without it, the session shows up as
+    /// unfinished when the log is verified.
+    pub async fn finish(&self) -> Result<()> {
+        self.record(Event::SessionEnd).await
+    }
+
     /// Serves one agent connection until it closes.
     pub async fn serve(
         self: Arc<Self>,
@@ -121,31 +127,11 @@ impl Proxy {
     }
 
     async fn list_tools(&self) -> Result<Value> {
-        let mut tools = Vec::new();
-        for upstream in &self.upstreams {
-            let mut cursor: Option<Value> = None;
-            loop {
-                let params = match &cursor {
-                    Some(c) => json!({ "cursor": c }),
-                    None => json!({}),
-                };
-                let mut page = upstream.request("tools/list", params).await?;
-                if let Some(Value::Array(list)) = page.get_mut("tools").map(Value::take) {
-                    for mut tool in list {
-                        if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                            let namespaced = format!("{}{NAMESPACE_SEP}{name}", upstream.name);
-                            tool["name"] = Value::String(namespaced);
-                            tools.push(tool);
-                        }
-                    }
-                }
-                cursor = page.get("nextCursor").filter(|c| !c.is_null()).cloned();
-                if cursor.is_none() {
-                    break;
-                }
-            }
+        let listing = list_tools(&self.upstreams).await;
+        for (server, error) in &listing.failures {
+            eprintln!("aegis: leaving out the tools of {server:?}: {error:#}");
         }
-        Ok(json!({ "tools": tools }))
+        Ok(json!({ "tools": listing.tools }))
     }
 
     async fn call_tool(&self, mut params: Value) -> Result<Result<Value, Value>> {
@@ -239,6 +225,72 @@ impl Proxy {
             None => Ok(()),
         }
     }
+}
+
+/// Tools gathered from every upstream, under their namespaced names.
+pub struct Listing {
+    pub tools: Vec<Value>,
+    /// Servers whose tools could not be listed, and why.
+    pub failures: Vec<(String, anyhow::Error)>,
+}
+
+/// Most pages a single server may return for one listing.
+const MAX_PAGES: usize = 100;
+
+/// Lists the tools of every upstream. A server that fails to answer is left
+/// out (and reported) rather than hiding every other server's tools.
+pub async fn list_tools(upstreams: &[Arc<Upstream>]) -> Listing {
+    let mut listing = Listing {
+        tools: Vec::new(),
+        failures: Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for upstream in upstreams {
+        match list_server_tools(upstream).await {
+            Ok(tools) => {
+                for tool in tools {
+                    // A server listing the same tool twice gets one entry.
+                    let name = tool["name"].as_str().unwrap_or_default().to_string();
+                    if seen.insert(name) {
+                        listing.tools.push(tool);
+                    }
+                }
+            }
+            Err(e) => listing.failures.push((upstream.name.clone(), e)),
+        }
+    }
+    listing
+}
+
+async fn list_server_tools(upstream: &Upstream) -> Result<Vec<Value>> {
+    let mut tools = Vec::new();
+    let mut cursors = std::collections::HashSet::new();
+    let mut cursor: Option<Value> = None;
+    for _ in 0..MAX_PAGES {
+        let params = match &cursor {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let mut page = upstream.request("tools/list", params).await?;
+        if let Some(Value::Array(list)) = page.get_mut("tools").map(Value::take) {
+            for mut tool in list {
+                if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                    let namespaced = format!("{}{NAMESPACE_SEP}{name}", upstream.name);
+                    tool["name"] = Value::String(namespaced);
+                    tools.push(tool);
+                }
+            }
+        }
+        cursor = page.get("nextCursor").filter(|c| !c.is_null()).cloned();
+        match &cursor {
+            None => return Ok(tools),
+            Some(c) if !cursors.insert(c.to_string()) => {
+                anyhow::bail!("server repeated page cursor {c}")
+            }
+            Some(_) => {}
+        }
+    }
+    anyhow::bail!("server returned more than {MAX_PAGES} pages of tools")
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {

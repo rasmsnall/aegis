@@ -5,10 +5,17 @@
 
 [audit]
 path = "aegis-audit.jsonl"
+# Sign the log so it cannot be rewritten without this key. Keep the file out
+# of reach of the servers below (another user, or outside their sandbox), or
+# set AEGIS_AUDIT_KEY instead; aegis never passes that variable on to servers.
+# key_file = "/etc/aegis/audit.key"
 
 [policy]
 # What happens to a tool call no rule matches.
 default = "allow"
+# Labels for output of tools no [[source]] below matches. Unlisted tools are
+# untrusted, so a new or renamed tool is never trusted by accident.
+default_labels = ["untrusted"]
 
 # --- Upstream MCP servers (stdio) ----------------------------------------
 
@@ -26,6 +33,8 @@ env = { GITHUB_TOOLSETS = "repos,issues,pull_requests" }
 [[server]]
 name = "shell"
 command = "my-shell-mcp-server"
+# A request that takes longer than this fails instead of hanging the agent.
+call_timeout_secs = 120
 
 # --- Sources: labels attached to tool output ------------------------------
 # Once a session has seen output with a label, the label stays for the rest
@@ -34,6 +43,11 @@ command = "my-shell-mcp-server"
 [[source]]
 tool = "web__*"
 labels = ["untrusted", "external"]
+
+# Code and metadata from our own repositories are trusted (labels = []).
+[[source]]
+tool = "github__get_file_contents"
+labels = []
 
 # Issue and PR text is written by anyone who can open one.
 [[source]]

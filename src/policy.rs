@@ -8,6 +8,11 @@
 //! This is coarse — it assumes anything the agent has read may influence
 //! anything it does next — but that assumption is exactly what makes it sound
 //! against prompt injection: the model cannot be talked out of it.
+//!
+//! Labelling fails closed: output of a tool no source matches gets the
+//! policy's `default_labels` (`untrusted` unless configured otherwise), so a
+//! newly added or renamed tool is never trusted by accident. A source with
+//! `labels = []` marks a tool's output as trusted.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +25,8 @@ pub enum Action {
     Deny,
 }
 
-/// Labels attached to the output of every tool matching `tool`.
+/// Labels attached to the output of every tool matching `tool`. Empty
+/// `labels` marks the output as trusted.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -49,6 +55,8 @@ pub struct Policy {
     pub sources: Vec<Source>,
     pub rules: Vec<Rule>,
     pub default: Action,
+    /// Labels for the output of tools that no source matches.
+    pub default_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,10 +72,29 @@ pub struct Decision {
 impl Policy {
     /// Labels carried by the output of `tool`.
     pub fn labels_for_result(&self, tool: &str) -> LabelSet {
-        self.sources
-            .iter()
-            .filter(|s| glob_match(&s.tool, tool))
-            .flat_map(|s| s.labels.iter().cloned())
+        let mut matched = false;
+        let mut labels = LabelSet::new();
+        for source in self.sources.iter().filter(|s| glob_match(&s.tool, tool)) {
+            matched = true;
+            labels.extend(source.labels.iter().cloned());
+        }
+        if !matched {
+            labels.extend(self.default_labels.iter().cloned());
+        }
+        labels
+    }
+
+    /// Whether any source names `tool` explicitly.
+    pub fn has_source_for(&self, tool: &str) -> bool {
+        self.sources.iter().any(|s| glob_match(&s.tool, tool))
+    }
+
+    /// 1-based indexes of the rules whose tool pattern matches `tool`,
+    /// whatever their label conditions.
+    pub fn rules_for(&self, tool: &str) -> Vec<usize> {
+        (0..self.rules.len())
+            .filter(|&i| glob_match(&self.rules[i].tool, tool))
+            .map(|i| i + 1)
             .collect()
     }
 
@@ -133,10 +160,20 @@ mod tests {
 
     fn policy() -> Policy {
         Policy {
-            sources: vec![Source {
-                tool: "web__*".into(),
-                labels: vec!["untrusted".into()],
-            }],
+            sources: vec![
+                Source {
+                    tool: "web__*".into(),
+                    labels: vec!["untrusted".into()],
+                },
+                Source {
+                    tool: "files__*".into(),
+                    labels: vec![],
+                },
+                Source {
+                    tool: "shell__*".into(),
+                    labels: vec![],
+                },
+            ],
             rules: vec![
                 Rule {
                     tool: "shell__*".into(),
@@ -152,7 +189,34 @@ mod tests {
                 },
             ],
             default: Action::Allow,
+            default_labels: vec!["untrusted".into()],
         }
+    }
+
+    #[test]
+    fn unlisted_tools_get_default_labels() {
+        let mut policy = policy();
+        assert!(policy.labels_for_result("files__read").is_empty());
+        assert!(policy.labels_for_result("mail__read").contains("untrusted"));
+        assert!(!policy.has_source_for("mail__read"));
+
+        let mut session = Session::default();
+        session.observe_result(&policy, "mail__read");
+        assert_eq!(
+            session.check_call(&policy, "shell__exec").action,
+            Action::Deny
+        );
+
+        policy.default_labels.clear();
+        assert!(policy.labels_for_result("mail__read").is_empty());
+    }
+
+    #[test]
+    fn rules_for_ignores_label_conditions() {
+        let policy = policy();
+        assert_eq!(policy.rules_for("shell__exec"), vec![1]);
+        assert_eq!(policy.rules_for("danger__rm"), vec![2]);
+        assert!(policy.rules_for("files__read").is_empty());
     }
 
     #[test]
