@@ -99,6 +99,9 @@ enum Command {
         /// Key the log was signed with; defaults to AEGIS_AUDIT_KEY.
         #[arg(long)]
         key_file: Option<PathBuf>,
+        /// Print a Markdown table (for pull request comments) instead.
+        #[arg(long)]
+        markdown: bool,
     },
 }
 
@@ -219,31 +222,40 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             log,
             config,
             key_file,
+            markdown,
         } => {
             let config = Config::load(&config)?;
             let entries = audit::read(&log)?;
             let key = AuditKey::load(key_file.as_deref())?;
-            if let Err(e) = audit::verify(&entries, key.as_ref()) {
+            let verified = audit::verify(&entries, key.as_ref());
+            if let Err(e) = &verified {
                 eprintln!("warning: audit log fails verification: {e}");
             }
             let report = replay::replay(&entries, &config.policy());
-            for change in &report.changes {
-                let verb = match change.replayed.action {
-                    Action::Allow => "now ALLOWED",
-                    Action::Deny => "now DENIED ",
-                    Action::Ask => "now ASKS   ",
-                };
-                let rule = change
-                    .replayed
-                    .rule
-                    .map_or("default".into(), |r| format!("rule #{r}"));
-                println!("#{:<6} {verb} {} ({rule})", change.seq, change.tool);
+            if markdown {
+                print!(
+                    "{}",
+                    replay_markdown(&log.display().to_string(), &report, verified.is_ok())
+                );
+            } else {
+                for change in &report.changes {
+                    let verb = match change.replayed.action {
+                        Action::Allow => "now ALLOWED",
+                        Action::Deny => "now DENIED ",
+                        Action::Ask => "now ASKS   ",
+                    };
+                    let rule = change
+                        .replayed
+                        .rule
+                        .map_or("default".into(), |r| format!("rule #{r}"));
+                    println!("#{:<6} {verb} {} ({rule})", change.seq, change.tool);
+                }
+                println!(
+                    "{} calls replayed, {} decisions changed",
+                    report.calls,
+                    report.changes.len()
+                );
             }
-            println!(
-                "{} calls replayed, {} decisions changed",
-                report.calls,
-                report.changes.len()
-            );
             Ok(if report.changes.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -397,6 +409,40 @@ fn describe_rules(policy: &Policy, tool: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A replay report as a Markdown section, for pull request comments.
+fn replay_markdown(log: &str, report: &replay::Report, verified: bool) -> String {
+    let mut out = format!("#### `{log}`\n\n");
+    out += &format!(
+        "{} replayed, {} changed.",
+        plural(report.calls, "call", "calls"),
+        plural(report.changes.len(), "decision", "decisions")
+    );
+    if !verified {
+        out += " ⚠️ This log fails verification.";
+    }
+    out += "\n\n";
+    if report.changes.is_empty() {
+        return out;
+    }
+    out += "| Entry | Tool | Recorded | With this policy | Because |\n|---:|---|---|---|---|\n";
+    for change in &report.changes {
+        let d = &change.replayed;
+        let mut why = d.rule.map_or("default".into(), |r| format!("rule #{r}"));
+        if !d.matched_labels.is_empty() {
+            why += &format!(", context has {}", d.matched_labels.join(", "));
+        }
+        out += &format!(
+            "| #{} | `{}` | {} | **{}** | {} |\n",
+            change.seq,
+            change.tool.replace('|', "\\|"),
+            change.recorded.as_str(),
+            d.action.as_str(),
+            why
+        );
+    }
+    out + "\n"
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {

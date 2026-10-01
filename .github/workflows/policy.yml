@@ -1,0 +1,30 @@
+name: Policy replay
+
+# Dogfoods the aegis GitHub Action (action.yml): a pull request that changes
+# the example policy gets a comment listing the recorded calls it would
+# decide differently.
+on:
+  pull_request:
+    paths:
+      - examples/aegis.toml
+      - examples/session.jsonl
+      - action.yml
+      - src/**
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # This repository tests the action against aegis built from the PR.
+      - run: cargo build --locked && echo "$PWD/target/debug" >> "$GITHUB_PATH"
+      - uses: ./
+        with:
+          version: none
+          config: examples/aegis.toml
+          logs: examples/session.jsonl

@@ -1,0 +1,122 @@
+name: aegis policy replay
+description: Replays recorded agent sessions against the policy in a pull request and reports every tool call it would decide differently.
+author: rasmsnall
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  config:
+    description: The aegis.toml to check and replay against.
+    default: aegis.toml
+  logs:
+    description: Audit logs to replay (paths or globs, separated by spaces or newlines).
+    default: aegis-audit.jsonl
+  version:
+    description: aegis release to install, like v0.4.0, or "latest". Use "none" when aegis is already on PATH.
+    default: latest
+  comment:
+    description: Post (and keep updating) a pull request comment with the result. Needs `pull-requests write` permission.
+    default: "true"
+  fail-on-change:
+    description: Fail the job when any decision would change.
+    default: "false"
+
+outputs:
+  changed:
+    description: '"true" when the policy would decide at least one recorded call differently.'
+    value: ${{ steps.replay.outputs.changed }}
+  report:
+    description: Path to the Markdown report.
+    value: ${{ steps.replay.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install aegis
+      if: inputs.version != 'none'
+      shell: bash
+      env:
+        AEGIS_VERSION: ${{ inputs.version }}
+        AEGIS_INSTALL_DIR: ${{ runner.temp }}/aegis-bin
+      run: |
+        sh "$GITHUB_ACTION_PATH/install.sh"
+        echo "$AEGIS_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Replay recorded sessions
+      id: replay
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        LOGS: ${{ inputs.logs }}
+      run: |
+        # Exit status 2 from replay means "changed", not failure.
+        set +e -uo pipefail
+        shopt -s globstar nullglob
+        report="$RUNNER_TEMP/aegis-replay.md"
+        {
+          echo "<!-- aegis-replay -->"
+          echo "### 🛡️ aegis policy replay"
+          echo
+          echo "\`$CONFIG\` replayed against recorded sessions: every tool call it would decide differently from what happened."
+          echo
+        } > "$report"
+
+        if ! aegis check -c "$CONFIG" > "$RUNNER_TEMP/aegis-check.txt" 2>&1; then
+          cat "$RUNNER_TEMP/aegis-check.txt"
+          { echo "**\`$CONFIG\` is invalid:**"; echo; echo '```'; cat "$RUNNER_TEMP/aegis-check.txt"; echo '```'; } >> "$report"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        changed=false
+        found=0
+        for pattern in $LOGS; do
+          for log in $pattern; do
+            found=$((found + 1))
+            aegis replay "$log" -c "$CONFIG" --markdown >> "$report"
+            status=$?
+            case $status in
+              0) ;;
+              2) changed=true ;;
+              *) echo "::error::aegis replay failed on $log"; exit "$status" ;;
+            esac
+          done
+        done
+        if [ "$found" -eq 0 ]; then
+          echo "::warning::no audit logs matched: $LOGS"
+          echo "No audit logs matched \`$LOGS\`." >> "$report"
+        elif [ "$changed" = false ]; then
+          echo "✅ No recorded decision changes." >> "$report"
+        fi
+
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        echo "changed=$changed" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event.pull_request.number
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPORT: ${{ steps.replay.outputs.report }}
+      run: |
+        # Update our earlier comment rather than adding one per push.
+        existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+          --jq '.[] | select(.body | startswith("<!-- aegis-replay -->")) | .id' | head -n 1) || existing=""
+        body=$(jq -Rs '{body: .}' < "$REPORT")
+        if [ -n "$existing" ]; then
+          echo "$body" | gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" --input - > /dev/null
+        else
+          echo "$body" | gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - > /dev/null
+        fi || echo "::warning::could not comment on the pull request (a fork, or no pull-requests: write permission); the report is in the job summary"
+
+    - name: Fail on changed decisions
+      if: inputs.fail-on-change == 'true' && steps.replay.outputs.changed == 'true'
+      shell: bash
+      run: |
+        echo "::error::the policy changes recorded decisions; see the job summary"
+        exit 1

@@ -70,6 +70,12 @@ labels = ["untrusted"]
 tool = "github__*pull_request*"
 labels = ["untrusted"]
 
+# Our own commands' output. Untrusted text can't reach the shell (rule #1),
+# so what it prints doesn't need to block the next command.
+[[source]]
+tool = "shell__*"
+labels = []
+
 # --- Rules: checked in order, first match decides ------------------------
 
 [[rule]]
