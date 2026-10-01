@@ -22,7 +22,7 @@ default = "allow"
 # untrusted, so a new or renamed tool is never trusted by accident.
 default_labels = ["untrusted"]
 
-# --- Upstream MCP servers (stdio) ----------------------------------------
+# --- Upstream MCP servers ------------------------------------------------
 
 [[server]]
 name = "web"
@@ -40,6 +40,18 @@ name = "shell"
 command = "my-shell-mcp-server"
 # A request that takes longer than this fails instead of hanging the agent.
 call_timeout_secs = 120
+# Confine what the server itself can touch (Linux, Landlock). Unlisted
+# paths can't be read or written, and outgoing TCP is limited to these ports.
+# [server.sandbox]
+# write = ["/home/me/project", "/tmp"]
+# connect_ports = [443]
+
+# A remote server, over MCP's Streamable HTTP transport. ${VAR} in headers is
+# read from the environment.
+# [[server]]
+# name = "linear"
+# url = "https://mcp.linear.app/mcp"
+# headers = { Authorization = "Bearer ${LINEAR_TOKEN}" }
 
 # --- Sources: labels attached to tool output ------------------------------
 # Once a session has seen output with a label, the label stays for the rest

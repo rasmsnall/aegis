@@ -25,6 +25,7 @@ reason = "no shell once untrusted content is in context"`;
 const CLI = `aegis init   --from .mcp.json --replace
 aegis tools  -c aegis.toml
 aegis run    -c aegis.toml
+aegis watch  aegis-audit.jsonl
 aegis report aegis-audit.jsonl
 aegis replay aegis-audit.jsonl -c new.toml`;
 
