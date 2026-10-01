@@ -39,12 +39,25 @@ That wouldn't work if each server had its own proxy.
 
 ```sh
 cargo install mcp-aegis                    # installs the `aegis` command
+aegis init   --from .mcp.json              # starting config from your agent's MCP servers
 aegis check  -c aegis.toml                 # validate config (offline)
 aegis tools  -c aegis.toml                 # list tools with their labels and rules
 aegis run    -c aegis.toml                 # serve MCP on stdio
 aegis verify aegis-audit.jsonl             # check the log's chain and signatures
 aegis replay aegis-audit.jsonl -c new.toml # what would new.toml decide differently?
+aegis report aegis-audit.jsonl             # the log as an HTML page
 ```
+
+`aegis init` reads your agent's MCP config (Claude Code's `.mcp.json`,
+`~/.claude.json`, Claude Desktop or Cursor; anything with an `mcpServers`
+object), starts each server briefly to see its tools, and writes an
+`aegis.toml` with a commented starting policy: web servers untrusted except
+well-known documentation hosts, file servers trusted and tracked across
+sessions, shell servers blocked once untrusted data is in play, and pushes,
+merges and deletes asking a person. It then prints the one entry that
+replaces your servers in the agent's config, or with `--replace` rewrites the
+config for you and keeps the original as `<file>.aegis-backup`. Remote (HTTP)
+servers are left in place, since aegis only launches stdio servers.
 
 Configure your agent to launch `aegis run -c aegis.toml` as its only MCP
 server. Run `aegis tools` after changing the config: it starts the servers,
@@ -172,6 +185,12 @@ Tool arguments are logged according to `[audit].arguments`. The default,
 credentials (`Bearer ...`, `ghp_...`, `sk-...`, private keys) with
 `"[redacted]"`. Add names with `redact_keys`. `hash` keeps only a SHA-256 of
 the arguments, `omit` drops them, and `full` keeps them as sent.
+
+`aegis report` turns a log into a self-contained HTML page: whether it
+verifies, then per session what ran, what was blocked or approved and why,
+and the entry from which the session held labelled data. Everything from the
+log is escaped, so text an attacker planted in a tool's output shows up as
+text.
 
 ## Semantics and limits
 

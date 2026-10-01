@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+- **`aegis init`** writes a starting `aegis.toml` from an agent's MCP config
+  (Claude Code, Claude Desktop, Cursor). It starts each server briefly to see
+  its tools, classifies servers by name, tools and command, writes a
+  commented policy, and prints the entry that puts aegis in front of them, or
+  rewrites the agent's config with `--replace` (keeping a backup).
+- **`aegis report`** renders an audit log as a self-contained HTML page:
+  verification status, per-session summary, the first moment the session
+  held labelled data, and every call with its decision and reason.
+- JSON objects keep their order, so `--replace` leaves the rest of the
+  agent's config as it was.
+
 ## 0.2.0
 
 - **Trust by host, path or argument.** A `[[source]]` can depend on the

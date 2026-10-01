@@ -22,9 +22,10 @@ when_context_has = ["untrusted"]
 action = "deny"
 reason = "no shell once untrusted content is in context"`;
 
-const CLI = `aegis check  -c aegis.toml
+const CLI = `aegis init   --from .mcp.json --replace
+aegis tools  -c aegis.toml
 aegis run    -c aegis.toml
-aegis verify aegis-audit.jsonl
+aegis report aegis-audit.jsonl
 aegis replay aegis-audit.jsonl -c new.toml`;
 
 function Shield({ size = 22 }: { size?: number }) {
@@ -188,8 +189,9 @@ export function App() {
             <p className="mono eyebrow">Get started</p>
             <h2>One config. One proxy.</h2>
             <p className="dim">
-              Point your agent at <code>aegis run</code> as its only MCP server. Tools appear as{" "}
-              <code>&lt;server&gt;__&lt;tool&gt;</code>, so one session covers every server.
+              <code>aegis init</code> reads your agent's MCP config, writes a commented starting policy and
+              puts aegis in front of your servers. Tools appear as <code>&lt;server&gt;__&lt;tool&gt;</code>, so
+              one session covers every server.
             </p>
           </div>
           <div className="code-grid">

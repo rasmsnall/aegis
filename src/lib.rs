@@ -13,9 +13,13 @@ pub mod audit;
 #[cfg(feature = "runtime")]
 pub mod config;
 #[cfg(feature = "runtime")]
+pub mod init;
+#[cfg(feature = "runtime")]
 pub mod proxy;
 #[cfg(feature = "runtime")]
 pub mod replay;
+#[cfg(feature = "runtime")]
+pub mod report;
 #[cfg(feature = "runtime")]
 pub mod resources;
 #[cfg(feature = "runtime")]

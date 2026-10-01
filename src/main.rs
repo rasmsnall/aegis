@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use aegis::audit::{self, AuditKey, AuditLog};
@@ -46,6 +47,37 @@ enum Command {
     /// Verify an audit log's chain (and signatures, given the key).
     Verify {
         log: PathBuf,
+        /// Key the log was signed with; defaults to AEGIS_AUDIT_KEY.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    /// Write a starting aegis.toml from an agent's MCP config (Claude Code's
+    /// .mcp.json, Claude Desktop, Cursor) and show how to switch the agent
+    /// over to aegis.
+    Init {
+        /// The agent's MCP config to read.
+        #[arg(long, default_value = ".mcp.json")]
+        from: PathBuf,
+        /// Where to write the aegis config.
+        #[arg(short, long, default_value = "aegis.toml")]
+        config: PathBuf,
+        /// Overwrite an existing aegis config (and backup).
+        #[arg(long)]
+        force: bool,
+        /// Also rewrite the agent's MCP config to run aegis instead of the
+        /// servers, keeping the original as <file>.aegis-backup.
+        #[arg(long)]
+        replace: bool,
+        /// Don't start the servers to see their tools; write generic rules.
+        #[arg(long)]
+        no_probe: bool,
+    },
+    /// Render an audit log as an HTML report.
+    Report {
+        log: PathBuf,
+        /// Where to write the report.
+        #[arg(short, long, default_value = "aegis-report.html")]
+        output: PathBuf,
         /// Key the log was signed with; defaults to AEGIS_AUDIT_KEY.
         #[arg(long)]
         key_file: Option<PathBuf>,
@@ -128,6 +160,46 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!(
                     "warning: session starting at entry {seq} has no session_end: aegis is still running, crashed, or the log was cut short"
                 );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Init {
+            from,
+            config,
+            force,
+            replace,
+            no_probe,
+        } => init(&from, &config, force, replace, !no_probe).await,
+        Command::Report {
+            log,
+            output,
+            key_file,
+        } => {
+            let entries = audit::read(&log)?;
+            let key = AuditKey::load(key_file.as_deref())?;
+            let verified = audit::verify(&entries, key.as_ref()).map_err(|e| format!("{e:#}"));
+            let name = log.file_name().map_or_else(
+                || log.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            std::fs::write(&output, aegis::report::render(&name, &entries, &verified))
+                .with_context(|| format!("writing {}", output.display()))?;
+            match &verified {
+                Ok(v) => println!(
+                    "wrote {}: {} in {}{}",
+                    output.display(),
+                    plural(v.entries, "entry", "entries"),
+                    plural(v.sessions, "session", "sessions"),
+                    if v.signed {
+                        ", signatures valid"
+                    } else {
+                        ", unsigned"
+                    }
+                ),
+                Err(e) => println!(
+                    "wrote {}, but the log FAILED verification: {e}",
+                    output.display()
+                ),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -301,4 +373,150 @@ fn describe_rules(policy: &Policy, tool: &str) -> String {
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Starts each server briefly and lists its tools, by original name. Servers
+/// that don't start or answer are left out (and reported).
+async fn probe_tools(
+    servers: &[(String, aegis::init::McpServer)],
+) -> BTreeMap<String, Vec<String>> {
+    let mut found = BTreeMap::new();
+    for (original, server) in servers {
+        let Some(command) = server.command.clone().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let config = aegis::config::ServerConfig {
+            name: aegis::init::sanitize_name(original),
+            command,
+            args: server.args.clone(),
+            env: server.env.clone(),
+            startup_timeout_secs: 10,
+            call_timeout_secs: 10,
+        };
+        let listed =
+            match Upstream::spawn(&config, aegis::upstream::DEFAULT_MAX_MESSAGE_BYTES).await {
+                Ok(upstream) => {
+                    let listing = proxy::list_tools(&[upstream]).await;
+                    match listing.failures.into_iter().next() {
+                        Some((_, e)) => Err(e),
+                        None => Ok(listing.tools),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+        match listed {
+            Ok(tools) => {
+                let prefix = format!("{}{}", config.name, aegis::config::NAMESPACE_SEP);
+                let names = tools
+                    .iter()
+                    .filter_map(|t| {
+                        t["name"]
+                            .as_str()?
+                            .strip_prefix(&prefix)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                found.insert(original.clone(), names);
+            }
+            Err(e) => println!(
+                "  couldn't list the tools of \"{original}\" ({e:#}); using generic rules for it"
+            ),
+        }
+    }
+    found
+}
+
+async fn init(
+    from: &Path,
+    config: &Path,
+    force: bool,
+    replace: bool,
+    probe: bool,
+) -> Result<ExitCode> {
+    use aegis::init;
+    let text = std::fs::read_to_string(from).with_context(|| {
+        format!(
+            "reading {} (point --from at your agent's MCP config, e.g. .mcp.json for Claude Code)",
+            from.display()
+        )
+    })?;
+    let servers =
+        init::parse_client_config(&text).with_context(|| format!("reading {}", from.display()))?;
+    if config.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite it",
+            config.display()
+        );
+    }
+    let tools = if probe {
+        println!("starting each server briefly to see its tools…");
+        probe_tools(&servers).await
+    } else {
+        BTreeMap::new()
+    };
+    let generated = init::generate(&servers, &tools);
+    if generated.servers.is_empty() {
+        bail!(
+            "{} has no servers aegis can run (only stdio servers with a command are supported)",
+            from.display()
+        );
+    }
+    std::fs::write(config, &generated.toml)
+        .with_context(|| format!("writing {}", config.display()))?;
+
+    println!(
+        "wrote {} for {}:",
+        config.display(),
+        plural(generated.servers.len(), "server", "servers")
+    );
+    for (name, kind) in &generated.servers {
+        println!("  {name:20} {}", init::describe(*kind));
+    }
+    for (original, name) in &generated.renamed {
+        println!(
+            "  (\"{original}\" is called \"{name}\": aegis server names use letters, digits and -)"
+        );
+    }
+    for (name, why) in &generated.skipped {
+        println!("  skipped \"{name}\": {why}");
+    }
+    if servers.iter().any(|(_, s)| !s.env.is_empty()) {
+        println!(
+            "\nnote: {} contains environment values copied from {}. If they are secrets, keep it out of version control.",
+            config.display(),
+            from.display()
+        );
+    }
+
+    let config_path = std::fs::canonicalize(config)?.display().to_string();
+    if replace {
+        let backup = PathBuf::from(format!("{}.aegis-backup", from.display()));
+        if backup.exists() && !force {
+            bail!(
+                "{} already exists; pass --force to overwrite it",
+                backup.display()
+            );
+        }
+        std::fs::copy(from, &backup).with_context(|| format!("backing up {}", from.display()))?;
+        let replaced = init::replace_servers(&text, &config_path, &generated.skipped)?;
+        std::fs::write(from, replaced).with_context(|| format!("writing {}", from.display()))?;
+        println!(
+            "\nrewrote {} to run aegis instead (original saved as {}).",
+            from.display(),
+            backup.display()
+        );
+    } else {
+        let entry =
+            serde_json::json!({ "mcpServers": { "aegis": init::client_entry(&config_path) } });
+        println!(
+            "\nTo put aegis in front of these servers, replace them in {} with:\n\n{}\n\n(or run again with --replace to do it for you, keeping a backup)",
+            from.display(),
+            serde_json::to_string_pretty(&entry)?
+        );
+    }
+    println!(
+        "\nNext: `aegis tools -c {}` to check what each tool's output is labelled.",
+        config.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
