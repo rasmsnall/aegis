@@ -38,7 +38,7 @@ That wouldn't work if each server had its own proxy.
 ## Usage
 
 ```sh
-cargo install --git https://github.com/rasmsnall/aegis  # installs the `aegis` command
+cargo install mcp-aegis                    # installs the `aegis` command
 aegis check  -c aegis.toml                 # validate config (offline)
 aegis tools  -c aegis.toml                 # list tools with their labels and rules
 aegis run    -c aegis.toml                 # serve MCP on stdio
