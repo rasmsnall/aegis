@@ -20,6 +20,25 @@ jobs:
       # The policy engine the website runs.
       - run: cargo build --release --lib --no-default-features --target wasm32-unknown-unknown
 
+  # The proxy also runs on macOS and Windows (without [server.sandbox]).
+  other-os:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+
+  # The script that installs release binaries.
+  install-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sh -n install.sh && shellcheck install.sh
+
   site:
     runs-on: ubuntu-latest
     defaults:

@@ -163,16 +163,28 @@ fn default_action() -> Action {
     Action::Allow
 }
 
-/// An upstream MCP server launched over stdio.
+/// An upstream MCP server: launched over stdio (`command`) or reached over
+/// MCP's Streamable HTTP transport (`url`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub name: String,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The endpoint of a remote server, instead of `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP headers sent to a remote server. `${VAR}` is replaced with the
+    /// environment variable `VAR`, so tokens stay out of the file.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Confines a launched server's file and network access (Linux).
+    #[serde(default)]
+    pub sandbox: Option<crate::sandbox::SandboxConfig>,
     /// How long the server may take to start and answer `initialize`.
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_secs: u64,
@@ -222,6 +234,38 @@ impl Config {
                     "server {:?}: timeouts must be at least 1 second",
                     server.name
                 );
+            }
+            match (&server.url, server.command.is_empty()) {
+                (Some(_), false) => bail!(
+                    "server {:?}: set either command or url, not both",
+                    server.name
+                ),
+                (None, true) => bail!("server {:?}: set command or url", server.name),
+                (Some(url), true) => {
+                    let parsed = url::Url::parse(url)
+                        .with_context(|| format!("server {:?}: url {url:?}", server.name))?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        bail!(
+                            "server {:?}: url must start with http:// or https://",
+                            server.name
+                        );
+                    }
+                    if !server.args.is_empty() || !server.env.is_empty() || server.sandbox.is_some()
+                    {
+                        bail!(
+                            "server {:?}: args, env and sandbox apply to launched servers, not to a url",
+                            server.name
+                        );
+                    }
+                }
+                (None, false) => {
+                    if !server.headers.is_empty() {
+                        bail!(
+                            "server {:?}: headers apply to url servers only",
+                            server.name
+                        );
+                    }
+                }
             }
             if !seen.insert(server.name.as_str()) {
                 bail!("duplicate server name {:?}", server.name);
@@ -290,6 +334,29 @@ mod tests {
         }
         for good in ["shell", "web-2", "GitHub"] {
             server_named(good).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn servers_have_command_or_url() {
+        let parse = |body: &str| {
+            toml::from_str::<Config>(&format!("[[server]]\nname = \"s\"\n{body}")).unwrap()
+        };
+        parse("url = \"https://mcp.example.com/mcp\"")
+            .validate()
+            .unwrap();
+        parse("url = \"https://x.dev/mcp\"\nheaders = { Authorization = \"Bearer ${T}\" }")
+            .validate()
+            .unwrap();
+        for bad in [
+            "",
+            "command = \"x\"\nurl = \"https://x.dev\"",
+            "url = \"ftp://x.dev\"",
+            "url = \"not a url\"",
+            "command = \"x\"\nheaders = { A = \"b\" }",
+            "url = \"https://x.dev\"\nargs = [\"a\"]",
+        ] {
+            assert!(parse(bad).validate().is_err(), "{bad:?} accepted");
         }
     }
 

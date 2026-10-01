@@ -5,6 +5,12 @@
 //! read through the `web` server must be able to block a call on the `shell`
 //! server, which is impossible if each server sits behind its own proxy.
 //!
+//! Resources and prompts pass through the same checks: reading a resource
+//! on server `web` is checked and labelled as the call `web__resources/read`
+//! with arguments `{"uri": ...}`, and getting a prompt as `web__prompts/get`
+//! with `{"name": ..., "arguments": ...}`, so `[[source]]` and `[[rule]]`
+//! patterns like `web__*` cover them too.
+//!
 //! For `action = "ask"` it also acts as a client of the agent's host: it
 //! sends an MCP `elicitation/create` request, which the host shows to the
 //! person using it. The model never sees that request and cannot answer it.
@@ -77,7 +83,16 @@ pub struct Proxy {
     client_pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     client_can_ask: AtomicBool,
     next_client_id: AtomicU64,
+    /// Which upstream listed each resource URI, from the last listing.
+    resource_owners: Mutex<HashMap<String, usize>>,
+    /// URI template prefixes (the part before the first `{`) per upstream.
+    resource_templates: Mutex<Vec<(String, usize)>>,
 }
+
+/// The pseudo tool name a resource read is checked and logged under.
+pub const READ_RESOURCE: &str = "resources/read";
+/// The pseudo tool name getting a prompt is checked and logged under.
+pub const GET_PROMPT: &str = "prompts/get";
 
 impl Proxy {
     pub fn new(
@@ -99,6 +114,8 @@ impl Proxy {
             client_pending: Mutex::default(),
             client_can_ask: AtomicBool::new(false),
             next_client_id: AtomicU64::new(1),
+            resource_owners: Mutex::default(),
+            resource_templates: Mutex::default(),
         });
         if let Some(log) = proxy.audit.try_lock().expect("fresh mutex").as_mut() {
             let servers = proxy.upstreams.iter().map(|u| u.name.clone()).collect();
@@ -197,18 +214,29 @@ impl Proxy {
             "initialize" => {
                 let can_ask = params.pointer("/capabilities/elicitation").is_some();
                 self.client_can_ask.store(can_ask, Ordering::Release);
+                let mut capabilities = json!({ "tools": {} });
+                for capability in ["resources", "prompts"] {
+                    if self.upstreams.iter().any(|u| u.supports(capability)) {
+                        capabilities[capability] = json!({});
+                    }
+                }
                 Ok(Ok(json!({
                     "protocolVersion": params
                         .get("protocolVersion")
                         .cloned()
                         .unwrap_or_else(|| PROTOCOL_VERSION.into()),
-                    "capabilities": { "tools": {} },
+                    "capabilities": capabilities,
                     "serverInfo": { "name": "aegis", "version": env!("CARGO_PKG_VERSION") },
                 })))
             }
             "ping" => Ok(Ok(json!({}))),
             "tools/list" => self.list_tools().await.map(Ok),
             "tools/call" => self.call_tool(params).await,
+            "resources/list" => self.list_resources().await.map(Ok),
+            "resources/templates/list" => self.list_resource_templates().await.map(Ok),
+            "resources/read" => self.read_resource(params).await,
+            "prompts/list" => self.list_prompts().await.map(Ok),
+            "prompts/get" => self.get_prompt(params).await,
             _ => Ok(Err(
                 json!({ "code": -32601, "message": format!("method not found: {method}") }),
             )),
@@ -245,7 +273,178 @@ impl Proxy {
             ));
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+        params["name"] = Value::String(tool);
+        self.guarded(upstream, &name, &arguments, "tools/call", params)
+            .await
+    }
 
+    async fn list_resources(&self) -> Result<Value> {
+        let mut owners = HashMap::new();
+        let mut resources = Vec::new();
+        for (i, upstream) in self.with("resources") {
+            match list_server(upstream, "resources/list", "resources").await {
+                Ok(list) => {
+                    for mut resource in list {
+                        let Some(uri) = resource.get("uri").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        // The first server to list a URI owns it.
+                        if owners.contains_key(uri) {
+                            continue;
+                        }
+                        owners.insert(uri.to_string(), i);
+                        namespace(&mut resource, &upstream.name);
+                        resources.push(resource);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "aegis: leaving out the resources of {:?}: {e:#}",
+                    upstream.name
+                ),
+            }
+        }
+        *self.resource_owners.lock().await = owners;
+        Ok(json!({ "resources": resources }))
+    }
+
+    async fn list_resource_templates(&self) -> Result<Value> {
+        let mut prefixes = Vec::new();
+        let mut templates = Vec::new();
+        for (i, upstream) in self.with("resources") {
+            match list_server(upstream, "resources/templates/list", "resourceTemplates").await {
+                Ok(list) => {
+                    for mut template in list {
+                        let Some(uri) = template.get("uriTemplate").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let prefix = uri.split('{').next().unwrap_or_default().to_string();
+                        prefixes.push((prefix, i));
+                        namespace(&mut template, &upstream.name);
+                        templates.push(template);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "aegis: leaving out the resource templates of {:?}: {e:#}",
+                    upstream.name
+                ),
+            }
+        }
+        *self.resource_templates.lock().await = prefixes;
+        Ok(json!({ "resourceTemplates": templates }))
+    }
+
+    /// The upstream that serves `uri`: the one that listed it, else the one
+    /// with the longest matching template, else the only resource server.
+    async fn resource_owner(&self, uri: &str) -> Option<usize> {
+        if let Some(&i) = self.resource_owners.lock().await.get(uri) {
+            return Some(i);
+        }
+        let by_template = self
+            .resource_templates
+            .lock()
+            .await
+            .iter()
+            .filter(|(prefix, _)| uri.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|&(_, i)| i);
+        if by_template.is_some() {
+            return by_template;
+        }
+        let mut servers = self.with("resources").map(|(i, _)| i);
+        match (servers.next(), servers.next()) {
+            (Some(i), None) => Some(i),
+            _ => None,
+        }
+    }
+
+    async fn read_resource(&self, params: Value) -> Result<Result<Value, Value>> {
+        let Some(uri) = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Ok(Err(
+                json!({ "code": -32602, "message": "resources/read requires a uri" }),
+            ));
+        };
+        if self.resource_owners.lock().await.is_empty() {
+            // The agent may read a URI it learned elsewhere; learn the owners.
+            self.list_resources().await?;
+        }
+        let Some(i) = self.resource_owner(&uri).await else {
+            return Ok(Err(
+                json!({ "code": -32002, "message": format!("resource not found: {uri}") }),
+            ));
+        };
+        let upstream = &self.upstreams[i];
+        let name = format!("{}{NAMESPACE_SEP}{READ_RESOURCE}", upstream.name);
+        let arguments = json!({ "uri": uri });
+        self.guarded(upstream, &name, &arguments, "resources/read", params)
+            .await
+    }
+
+    async fn list_prompts(&self) -> Result<Value> {
+        let mut prompts = Vec::new();
+        for (_, upstream) in self.with("prompts") {
+            match list_server(upstream, "prompts/list", "prompts").await {
+                Ok(list) => prompts.extend(list.into_iter().map(|mut prompt| {
+                    if let Some(name) = prompt.get("name").and_then(Value::as_str) {
+                        prompt["name"] = format!("{}{NAMESPACE_SEP}{name}", upstream.name).into();
+                    }
+                    prompt
+                })),
+                Err(e) => eprintln!(
+                    "aegis: leaving out the prompts of {:?}: {e:#}",
+                    upstream.name
+                ),
+            }
+        }
+        Ok(json!({ "prompts": prompts }))
+    }
+
+    async fn get_prompt(&self, mut params: Value) -> Result<Result<Value, Value>> {
+        let found = params
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|n| n.split_once(NAMESPACE_SEP))
+            .and_then(|(server, prompt)| {
+                self.with("prompts")
+                    .find(|(_, u)| u.name == server)
+                    .map(|(_, u)| (u, prompt.to_string()))
+            });
+        let Some((upstream, prompt)) = found else {
+            return Ok(Err(json!({ "code": -32602, "message": "unknown prompt" })));
+        };
+        let name = format!("{}{NAMESPACE_SEP}{GET_PROMPT}", upstream.name);
+        let arguments = json!({
+            "name": prompt,
+            "arguments": params.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        });
+        params["name"] = Value::String(prompt);
+        self.guarded(upstream, &name, &arguments, "prompts/get", params)
+            .await
+    }
+
+    /// The upstreams (with their index) that announced `capability`.
+    fn with(&self, capability: &str) -> impl Iterator<Item = (usize, &Arc<Upstream>)> {
+        let capability = capability.to_string();
+        self.upstreams
+            .iter()
+            .enumerate()
+            .filter(move |(_, u)| u.supports(&capability))
+    }
+
+    /// Checks, logs and forwards one request, then labels the session with
+    /// what it returned. `name` and `arguments` are what the policy sees.
+    async fn guarded(
+        &self,
+        upstream: &Upstream,
+        name: &str,
+        arguments: &Value,
+        method: &str,
+        params: Value,
+    ) -> Result<Result<Value, Value>> {
+        let name = name.to_string();
         let (mut decision, context) = {
             let session = self.session.lock().await;
             (
@@ -255,7 +454,7 @@ impl Proxy {
         };
         let mut note = None;
         if decision.action == Action::Ask {
-            let approval = self.ask_person(&name, &arguments, &decision).await;
+            let approval = self.ask_person(&name, arguments, &decision).await;
             decision.approved = Some(matches!(approval, Approval::Approved));
             note = match approval {
                 Approval::Approved | Approval::Declined => None,
@@ -266,7 +465,7 @@ impl Proxy {
         // Fail closed: a call that cannot be logged does not run.
         self.record(Event::ToolCall {
             tool: name.clone(),
-            arguments: log_arguments(self.arguments, &arguments, &self.redact_keys),
+            arguments: log_arguments(self.arguments, arguments, &self.redact_keys),
             context: context.iter().cloned().collect(),
             decision: decision.clone(),
         })
@@ -278,6 +477,10 @@ impl Proxy {
             if let Some(note) = note {
                 text += &format!(" ({note})");
             }
+            if method != "tools/call" {
+                // Only tool results can carry an error for the model to read.
+                return Ok(Err(json!({ "code": -32001, "message": text })));
+            }
             return Ok(Ok(
                 json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
             ));
@@ -286,12 +489,11 @@ impl Proxy {
         // Remember what this write carries into later sessions.
         if let Some(store) = self.resources.lock().await.as_mut() {
             store
-                .on_write(&name, &arguments, &context)
+                .on_write(&name, arguments, &context)
                 .context("saving resource labels")?;
         }
 
-        params["name"] = Value::String(tool);
-        let response = upstream.request_raw("tools/call", params).await?;
+        let response = upstream.request_raw(method, params).await?;
 
         // Taint the context before the agent can see the output.
         let is_error = match &response {
@@ -302,12 +504,12 @@ impl Proxy {
             Err(_) => true,
         };
         let recalled: LabelSet = match self.resources.lock().await.as_ref() {
-            Some(store) => store.on_read(&name, &arguments),
+            Some(store) => store.on_read(&name, arguments),
             None => LabelSet::new(),
         };
         let added = {
             let mut session = self.session.lock().await;
-            let mut added = session.observe_result(&self.policy, &name, &arguments);
+            let mut added = session.observe_result(&self.policy, &name, arguments);
             added.extend(session.add_labels(recalled.iter().cloned()));
             added
         };
@@ -451,7 +653,20 @@ pub async fn list_tools(upstreams: &[Arc<Upstream>]) -> Listing {
 }
 
 async fn list_server_tools(upstream: &Upstream) -> Result<Vec<Value>> {
-    let mut tools = Vec::new();
+    let mut tools = list_server(upstream, "tools/list", "tools").await?;
+    tools.retain_mut(|tool| {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        tool["name"] = Value::String(format!("{}{NAMESPACE_SEP}{name}", upstream.name));
+        true
+    });
+    Ok(tools)
+}
+
+/// Collects every page of a `*/list` request: the items under `key`.
+async fn list_server(upstream: &Upstream, method: &str, key: &str) -> Result<Vec<Value>> {
+    let mut items = Vec::new();
     let mut cursors = std::collections::HashSet::new();
     let mut cursor: Option<Value> = None;
     for _ in 0..MAX_PAGES {
@@ -459,26 +674,27 @@ async fn list_server_tools(upstream: &Upstream) -> Result<Vec<Value>> {
             Some(c) => json!({ "cursor": c }),
             None => json!({}),
         };
-        let mut page = upstream.request("tools/list", params).await?;
-        if let Some(Value::Array(list)) = page.get_mut("tools").map(Value::take) {
-            for mut tool in list {
-                if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                    let namespaced = format!("{}{NAMESPACE_SEP}{name}", upstream.name);
-                    tool["name"] = Value::String(namespaced);
-                    tools.push(tool);
-                }
-            }
+        let mut page = upstream.request(method, params).await?;
+        if let Some(Value::Array(list)) = page.get_mut(key).map(Value::take) {
+            items.extend(list);
         }
         cursor = page.get("nextCursor").filter(|c| !c.is_null()).cloned();
         match &cursor {
-            None => return Ok(tools),
+            None => return Ok(items),
             Some(c) if !cursors.insert(c.to_string()) => {
                 anyhow::bail!("server repeated page cursor {c}")
             }
             Some(_) => {}
         }
     }
-    anyhow::bail!("server returned more than {MAX_PAGES} pages of tools")
+    anyhow::bail!("server returned more than {MAX_PAGES} pages for {method}")
+}
+
+/// Shows which server a resource comes from in its display name.
+fn namespace(item: &mut Value, server: &str) {
+    if let Some(name) = item.get("name").and_then(Value::as_str) {
+        item["name"] = Value::String(format!("{server}{NAMESPACE_SEP}{name}"));
+    }
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {

@@ -47,7 +47,7 @@ pub fn format_time(ms: u64) -> String {
     )
 }
 
-fn verdict(d: &Decision) -> (&'static str, &'static str) {
+pub(crate) fn verdict(d: &Decision) -> (&'static str, &'static str) {
     match (d.action, d.approved) {
         (Action::Allow, _) => ("allowed", "ok"),
         (Action::Deny, _) => ("blocked", "stop"),

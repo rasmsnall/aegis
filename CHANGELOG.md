@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+- **Remote servers.** `url` (with `headers`, where `${VAR}` reads the
+  environment) reaches a server over MCP's Streamable HTTP transport: JSON
+  or event-stream answers, session ids and protocol version headers.
+  `aegis init` fronts `"type": "http"` servers instead of skipping them.
+- **Resources and prompts** pass through the policy, checked and labelled as
+  `<server>__resources/read` and `<server>__prompts/get`.
+- **`[server.sandbox]`** confines a launched server with Landlock on Linux:
+  read-only and read-write paths, and the TCP ports it may connect to. A
+  server whose sandbox can't be applied refuses to start.
+- **`aegis watch`** follows an audit log live.
+- **Prebuilt binaries** for Linux (static), macOS and Windows on every
+  release, and `install.sh` to install them.
+- **GitHub Action** (`uses: rasmsnall/aegis@v0.4.0`) that replays recorded
+  sessions against a pull request's policy and comments with the changes.
+  `aegis replay --markdown` prints the table it uses.
+- The example policy trusts shell output, as `aegis init` does.
+
 ## 0.3.0
 
 - **`aegis init`** writes a starting `aegis.toml` from an agent's MCP config

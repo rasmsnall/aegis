@@ -82,6 +82,14 @@ enum Command {
         #[arg(long)]
         key_file: Option<PathBuf>,
     },
+    /// Follow an audit log live, printing each call and decision.
+    Watch {
+        #[arg(default_value = "aegis-audit.jsonl")]
+        log: PathBuf,
+        /// How many earlier entries to show first.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
     /// Show which recorded tool calls a policy would decide differently.
     Replay {
         log: PathBuf,
@@ -91,6 +99,9 @@ enum Command {
         /// Key the log was signed with; defaults to AEGIS_AUDIT_KEY.
         #[arg(long)]
         key_file: Option<PathBuf>,
+        /// Print a Markdown table (for pull request comments) instead.
+        #[arg(long)]
+        markdown: bool,
     },
 }
 
@@ -114,7 +125,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let resources = ResourceStore::open(&config.state.path, config.resources.clone())?;
             let mut upstreams = Vec::new();
             for server in &config.servers {
-                upstreams.push(Upstream::spawn(server, config.limits.max_message_bytes).await?);
+                upstreams.push(Upstream::open(server, config.limits.max_message_bytes).await?);
             }
             let options = proxy::Options {
                 audit: Some(audit),
@@ -170,6 +181,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             replace,
             no_probe,
         } => init(&from, &config, force, replace, !no_probe).await,
+        Command::Watch { log, lines } => {
+            aegis::watch::follow(&log, lines, aegis::watch::Style::detect()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Report {
             log,
             output,
@@ -207,31 +222,40 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             log,
             config,
             key_file,
+            markdown,
         } => {
             let config = Config::load(&config)?;
             let entries = audit::read(&log)?;
             let key = AuditKey::load(key_file.as_deref())?;
-            if let Err(e) = audit::verify(&entries, key.as_ref()) {
+            let verified = audit::verify(&entries, key.as_ref());
+            if let Err(e) = &verified {
                 eprintln!("warning: audit log fails verification: {e}");
             }
             let report = replay::replay(&entries, &config.policy());
-            for change in &report.changes {
-                let verb = match change.replayed.action {
-                    Action::Allow => "now ALLOWED",
-                    Action::Deny => "now DENIED ",
-                    Action::Ask => "now ASKS   ",
-                };
-                let rule = change
-                    .replayed
-                    .rule
-                    .map_or("default".into(), |r| format!("rule #{r}"));
-                println!("#{:<6} {verb} {} ({rule})", change.seq, change.tool);
+            if markdown {
+                print!(
+                    "{}",
+                    replay_markdown(&log.display().to_string(), &report, verified.is_ok())
+                );
+            } else {
+                for change in &report.changes {
+                    let verb = match change.replayed.action {
+                        Action::Allow => "now ALLOWED",
+                        Action::Deny => "now DENIED ",
+                        Action::Ask => "now ASKS   ",
+                    };
+                    let rule = change
+                        .replayed
+                        .rule
+                        .map_or("default".into(), |r| format!("rule #{r}"));
+                    println!("#{:<6} {verb} {} ({rule})", change.seq, change.tool);
+                }
+                println!(
+                    "{} calls replayed, {} decisions changed",
+                    report.calls,
+                    report.changes.len()
+                );
             }
-            println!(
-                "{} calls replayed, {} decisions changed",
-                report.calls,
-                report.changes.len()
-            );
             Ok(if report.changes.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -245,7 +269,7 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     let mut warnings = Vec::new();
     let mut upstreams = Vec::new();
     for server in &config.servers {
-        match Upstream::spawn(server, config.limits.max_message_bytes).await {
+        match Upstream::open(server, config.limits.max_message_bytes).await {
             Ok(u) => upstreams.push(u),
             Err(e) => warnings.push(format!("server {:?} did not start: {e:#}", server.name)),
         }
@@ -254,11 +278,27 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     for (server, e) in &listing.failures {
         warnings.push(format!("server {server:?} did not list its tools: {e:#}"));
     }
-    let names: Vec<&str> = listing
+    let mut names: Vec<String> = listing
         .tools
         .iter()
-        .filter_map(|t| t["name"].as_str())
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
+    // Resource reads and prompts are checked like tool calls, under these names.
+    for upstream in &upstreams {
+        for (capability, pseudo) in [
+            ("resources", proxy::READ_RESOURCE),
+            ("prompts", proxy::GET_PROMPT),
+        ] {
+            if upstream.supports(capability) {
+                names.push(format!(
+                    "{}{}{pseudo}",
+                    upstream.name,
+                    aegis::config::NAMESPACE_SEP
+                ));
+            }
+        }
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
 
     let policy = config.policy();
     let rows: Vec<(&str, String, String)> = names
@@ -371,6 +411,40 @@ fn describe_rules(policy: &Policy, tool: &str) -> String {
         .join(", ")
 }
 
+/// A replay report as a Markdown section, for pull request comments.
+fn replay_markdown(log: &str, report: &replay::Report, verified: bool) -> String {
+    let mut out = format!("#### `{log}`\n\n");
+    out += &format!(
+        "{} replayed, {} changed.",
+        plural(report.calls, "call", "calls"),
+        plural(report.changes.len(), "decision", "decisions")
+    );
+    if !verified {
+        out += " ⚠️ This log fails verification.";
+    }
+    out += "\n\n";
+    if report.changes.is_empty() {
+        return out;
+    }
+    out += "| Entry | Tool | Recorded | With this policy | Because |\n|---:|---|---|---|---|\n";
+    for change in &report.changes {
+        let d = &change.replayed;
+        let mut why = d.rule.map_or("default".into(), |r| format!("rule #{r}"));
+        if !d.matched_labels.is_empty() {
+            why += &format!(", context has {}", d.matched_labels.join(", "));
+        }
+        out += &format!(
+            "| #{} | `{}` | {} | **{}** | {} |\n",
+            change.seq,
+            change.tool.replace('|', "\\|"),
+            change.recorded.as_str(),
+            d.action.as_str(),
+            why
+        );
+    }
+    out + "\n"
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
@@ -382,28 +456,37 @@ async fn probe_tools(
 ) -> BTreeMap<String, Vec<String>> {
     let mut found = BTreeMap::new();
     for (original, server) in servers {
-        let Some(command) = server.command.clone().filter(|c| !c.is_empty()) else {
+        let command = server.command.clone().filter(|c| !c.is_empty());
+        let url = server.url.clone().filter(|_| command.is_none());
+        if command.is_none() && url.is_none() {
             continue;
-        };
+        }
         let config = aegis::config::ServerConfig {
             name: aegis::init::sanitize_name(original),
-            command,
+            command: command.unwrap_or_default(),
             args: server.args.clone(),
             env: server.env.clone(),
+            headers: if url.is_some() {
+                server.headers.clone()
+            } else {
+                BTreeMap::new()
+            },
+            url,
+            sandbox: None,
             startup_timeout_secs: 10,
             call_timeout_secs: 10,
         };
-        let listed =
-            match Upstream::spawn(&config, aegis::upstream::DEFAULT_MAX_MESSAGE_BYTES).await {
-                Ok(upstream) => {
-                    let listing = proxy::list_tools(&[upstream]).await;
-                    match listing.failures.into_iter().next() {
-                        Some((_, e)) => Err(e),
-                        None => Ok(listing.tools),
-                    }
+        let listed = match Upstream::open(&config, aegis::upstream::DEFAULT_MAX_MESSAGE_BYTES).await
+        {
+            Ok(upstream) => {
+                let listing = proxy::list_tools(&[upstream]).await;
+                match listing.failures.into_iter().next() {
+                    Some((_, e)) => Err(e),
+                    None => Ok(listing.tools),
                 }
-                Err(e) => Err(e),
-            };
+            }
+            Err(e) => Err(e),
+        };
         match listed {
             Ok(tools) => {
                 let prefix = format!("{}{}", config.name, aegis::config::NAMESPACE_SEP);

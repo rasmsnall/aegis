@@ -13,6 +13,8 @@ pub mod audit;
 #[cfg(feature = "runtime")]
 pub mod config;
 #[cfg(feature = "runtime")]
+pub mod http;
+#[cfg(feature = "runtime")]
 pub mod init;
 #[cfg(feature = "runtime")]
 pub mod proxy;
@@ -23,7 +25,11 @@ pub mod report;
 #[cfg(feature = "runtime")]
 pub mod resources;
 #[cfg(feature = "runtime")]
+pub mod sandbox;
+#[cfg(feature = "runtime")]
 pub mod upstream;
+#[cfg(feature = "runtime")]
+pub mod watch;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;

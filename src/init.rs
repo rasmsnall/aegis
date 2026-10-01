@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// One server from an MCP client config.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct McpServer {
     #[serde(default)]
     pub command: Option<String>,
@@ -30,6 +30,11 @@ pub struct McpServer {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// `"stdio"`, `"http"` or the older `"sse"` transport.
+    #[serde(default, rename = "type")]
+    pub transport: Option<String>,
 }
 
 /// Reads `mcpServers` from a client config. Server order is kept.
@@ -244,15 +249,19 @@ pub fn generate(
     let mut used = BTreeSet::new();
     let mut kept: Vec<(String, &McpServer, Kind)> = Vec::new();
     for (original, server) in servers {
-        let Some(_) = server.command.as_deref().filter(|c| !c.is_empty()) else {
-            let why = if server.url.is_some() {
-                "remote (HTTP) servers are not supported by aegis yet"
-            } else {
-                "no command to launch"
-            };
+        let has_command = server.command.as_deref().is_some_and(|c| !c.is_empty());
+        let why = match (has_command, &server.url) {
+            (true, _) => None,
+            (false, Some(_)) if server.transport.as_deref() == Some("sse") => Some(
+                "uses the old SSE transport; aegis speaks Streamable HTTP (try the server's /mcp endpoint)",
+            ),
+            (false, Some(_)) => None,
+            (false, None) => Some("no command or url"),
+        };
+        if let Some(why) = why {
             skipped.push((original.clone(), why.to_string()));
             continue;
-        };
+        }
         let mut name = sanitize_name(original);
         let base = name.clone();
         let mut n = 2;
@@ -269,7 +278,7 @@ pub fn generate(
     // Every exposed tool name, if every kept server could be listed.
     let known: Option<Vec<String>> = servers
         .iter()
-        .filter(|(n, s)| s.command.is_some() && !skipped.iter().any(|(k, _)| k == n))
+        .filter(|(n, _)| !skipped.iter().any(|(k, _)| k == n))
         .zip(&kept)
         .map(|((original, _), (name, _, _))| {
             tools.get(original).map(|ts| {
@@ -319,6 +328,28 @@ pub fn generate(
     for (name, server, kind) in &kept {
         let _ = writeln!(w, "# Looks like: {}", describe(*kind));
         let _ = writeln!(w, "[[server]]\nname = {}", quote(name));
+        if let (Some(url), true) = (
+            &server.url,
+            server.command.as_deref().is_none_or(str::is_empty),
+        ) {
+            let _ = writeln!(w, "url = {}", quote(url));
+            if !server.headers.is_empty() {
+                if server.headers.values().any(|v| !v.contains("${")) {
+                    let _ = writeln!(
+                        w,
+                        "# Header values can read the environment, like \"Bearer ${{TOKEN}}\",\n# which keeps secrets out of this file."
+                    );
+                }
+                let headers: Vec<String> = server
+                    .headers
+                    .iter()
+                    .map(|(k, v)| format!("{} = {}", quote(k), quote(v)))
+                    .collect();
+                let _ = writeln!(w, "headers = {{ {} }}", headers.join(", "));
+            }
+            let _ = writeln!(w);
+            continue;
+        }
         let _ = writeln!(
             w,
             "command = {}",
@@ -487,7 +518,8 @@ mod tests {
         "github_api": { "command": "github-mcp-server", "args": ["stdio"], "env": { "GITHUB_TOKEN": "x" } },
         "desktop-commander": { "command": "npx", "args": ["@wonderwhy-er/desktop-commander"] },
         "notes": { "command": "my-notes-server" },
-        "remote": { "url": "https://mcp.example.com/sse" }
+        "remote": { "type": "sse", "url": "https://mcp.example.com/sse" },
+        "linear": { "type": "http", "url": "https://mcp.linear.app/mcp", "headers": { "Authorization": "Bearer ${LINEAR_TOKEN}" } }
       },
       "theme": "dark"
     }"#;
@@ -504,7 +536,8 @@ mod tests {
                 Kind::Collaboration,
                 Kind::Shell,
                 Kind::Other,
-                Kind::Other
+                Kind::Other,
+                Kind::Collaboration
             ]
         );
     }
@@ -524,7 +557,8 @@ mod tests {
                 "filesystem",
                 "github-api",
                 "desktop-commander",
-                "notes"
+                "notes",
+                "linear"
             ]
         );
         assert_eq!(
@@ -532,7 +566,11 @@ mod tests {
             [("github_api".to_string(), "github-api".to_string())]
         );
         assert_eq!(generated.skipped.len(), 1);
-        assert!(generated.skipped[0].1.contains("remote"));
+        assert!(generated.skipped[0].1.contains("SSE"));
+        let linear = config.servers.iter().find(|s| s.name == "linear").unwrap();
+        assert_eq!(linear.url.as_deref(), Some("https://mcp.linear.app/mcp"));
+        assert_eq!(linear.headers["Authorization"], "Bearer ${LINEAR_TOKEN}");
+        assert!(linear.command.is_empty());
         assert_eq!(config.servers[2].env["GITHUB_TOKEN"], "x");
 
         let policy = config.policy();
@@ -578,8 +616,7 @@ mod tests {
         let server = |args: &[&str]| McpServer {
             command: Some("python3".into()),
             args: args.iter().map(|a| a.to_string()).collect(),
-            env: Default::default(),
-            url: None,
+            ..Default::default()
         };
         // "files" in the arguments doesn't make a GitHub server a file server.
         assert_eq!(
@@ -615,6 +652,7 @@ mod tests {
             ("github_api", vec!["get_issue", "push_files"]),
             ("desktop-commander", vec!["execute_command"]),
             ("notes", vec!["list_notes"]),
+            ("linear", vec!["list_issues"]),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
@@ -636,18 +674,14 @@ mod tests {
                 "a_b".to_string(),
                 McpServer {
                     command: Some("x".into()),
-                    args: vec![],
-                    env: Default::default(),
-                    url: None,
+                    ..Default::default()
                 },
             ),
             (
                 "a-b".to_string(),
                 McpServer {
                     command: Some("y".into()),
-                    args: vec![],
-                    env: Default::default(),
-                    url: None,
+                    ..Default::default()
                 },
             ),
         ];

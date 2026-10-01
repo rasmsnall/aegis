@@ -35,14 +35,30 @@ aegis combines all servers behind one endpoint, so a single session context
 covers all of them. Data read through `web` can then block a call on `shell`.
 That wouldn't work if each server had its own proxy.
 
+![The website's playground replaying a prompt injection: the hidden instruction reaches the agent, and aegis blocks the shell command and holds the push for a person](https://raw.githubusercontent.com/rasmsnall/aegis/main/docs/playground.gif)
+
+Try it at https://rasmsnall.github.io/aegis/#playground, or read
+[the write-up](docs/writeup.md) on why this approach works.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rasmsnall/aegis/main/install.sh | sh
+```
+
+installs a prebuilt binary (Linux x86_64/arm64, static; macOS Intel/Apple
+silicon) to `~/.local/bin`, after checking its SHA-256. Windows binaries are
+on the [releases page](https://github.com/rasmsnall/aegis/releases). Or
+build it: `cargo install mcp-aegis`.
+
 ## Usage
 
 ```sh
-cargo install mcp-aegis                    # installs the `aegis` command
 aegis init   --from .mcp.json              # starting config from your agent's MCP servers
 aegis check  -c aegis.toml                 # validate config (offline)
 aegis tools  -c aegis.toml                 # list tools with their labels and rules
 aegis run    -c aegis.toml                 # serve MCP on stdio
+aegis watch  aegis-audit.jsonl             # follow calls and decisions live
 aegis verify aegis-audit.jsonl             # check the log's chain and signatures
 aegis replay aegis-audit.jsonl -c new.toml # what would new.toml decide differently?
 aegis report aegis-audit.jsonl             # the log as an HTML page
@@ -56,25 +72,36 @@ well-known documentation hosts, file servers trusted and tracked across
 sessions, shell servers blocked once untrusted data is in play, and pushes,
 merges and deletes asking a person. It then prints the one entry that
 replaces your servers in the agent's config, or with `--replace` rewrites the
-config for you and keeps the original as `<file>.aegis-backup`. Remote (HTTP)
-servers are left in place, since aegis only launches stdio servers.
+config for you and keeps the original as `<file>.aegis-backup`. Remote
+servers (`"type": "http"`) are fronted too; only servers on the old SSE
+transport are left in place.
 
 Configure your agent to launch `aegis run -c aegis.toml` as its only MCP
 server. Run `aegis tools` after changing the config: it starts the servers,
 shows what each tool's output is labelled and which rules apply, and warns
 about sources or rules that match no tool (usually a typo). With `--strict`
 it exits 1 on warnings. `aegis replay` exits with status 2 when decisions
-change, so both can gate policy changes in CI.
+change, so both can gate policy changes in CI (see
+[the GitHub Action](#policy-changes-in-pull-requests)).
+
+`aegis watch` follows the audit log while the agent works: each call as it
+happens, allowed or blocked and why, and the labels each result adds. It
+flags entries that don't follow on from the one before.
 
 ## Configuration
 
 See [`examples/aegis.toml`](examples/aegis.toml).
 
 ```toml
-[[server]]                 # upstream MCP servers (stdio)
+[[server]]                 # upstream MCP servers, launched over stdio...
 name = "web"
 command = "uvx"
 args = ["mcp-server-fetch"]
+
+[[server]]                 # ...or reached over HTTP
+name = "linear"
+url = "https://mcp.linear.app/mcp"
+headers = { Authorization = "Bearer ${LINEAR_TOKEN}" }   # read from the environment
 
 [[source]]                 # labels attached to tool output
 tool = "web__*"
@@ -121,6 +148,51 @@ Conditions a source can have (all must hold):
 If a condition can't be checked (the argument is missing, or isn't a web
 URL) the source doesn't match, and the next one decides, down to
 `default_labels`.
+
+### Remote servers
+
+A server with `url` instead of `command` is reached over MCP's Streamable
+HTTP transport: answers come back as JSON or as an event stream, and the
+session id and protocol version the server hands out are sent back on every
+request. `${VAR}` in `headers` is replaced by the environment variable, and
+a missing variable stops aegis rather than sending an empty token. Remote
+tools are labelled and checked like any others.
+
+### Resources and prompts
+
+Servers' resources and prompts pass through aegis too, under the same
+policy. Reading a resource from server `web` is checked and labelled as the
+call `web__resources/read` with arguments `{"uri": ...}`, and getting a
+prompt as `web__prompts/get` with `{"name": ..., "arguments": ...}`. So
+`tool = "web__*"` covers them, and `url_arg = "uri"` lets a source trust
+resources by host. `aegis tools` lists both entries for servers that have
+them.
+
+### Sandboxing servers
+
+The policy decides which calls run. A sandbox limits what a server can do
+once it runs, so a compromised server can't read your SSH keys or send them
+anywhere:
+
+```toml
+[[server]]
+name = "files"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/project"]
+
+[server.sandbox]
+read = ["/home/me/.npm"]              # read-only
+write = ["/home/me/project", "/tmp"]  # read-write
+connect_ports = [443]                 # outgoing TCP allowed only to these ports
+# network = true                      # allow all TCP instead
+# system = false                      # don't add /usr, /etc, /proc, ... read-only
+```
+
+On Linux this uses Landlock (kernel 5.13+, network rules 6.7+), which needs
+no root and also covers everything the server starts. Paths not listed
+can't be read or written at all, and the server can't listen for
+connections. Where Landlock isn't available, or on other systems, a server
+with a sandbox refuses to start rather than run unconfined.
 
 ### Asking a person
 
@@ -192,6 +264,36 @@ and the entry from which the session held labelled data. Everything from the
 log is escaped, so text an attacker planted in a tool's output shows up as
 text.
 
+## Policy changes in pull requests
+
+`action.yml` is a GitHub Action that replays recorded sessions against the
+policy in a pull request and comments with every call it would decide
+differently, so reviewers see what a rule change does to real traffic:
+
+```yaml
+on:
+  pull_request:
+    paths: [aegis.toml, audit/*.jsonl]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rasmsnall/aegis@v0.4.0
+        with:
+          config: aegis.toml
+          logs: audit/*.jsonl       # logs you've committed as test cases
+          # fail-on-change: true
+```
+
+It installs aegis, runs `aegis check`, replays each log with
+`aegis replay --markdown`, writes the result to the job summary and keeps
+one pull request comment up to date. Outputs: `changed` and `report`. This
+repository runs it on [`examples/session.jsonl`](examples/session.jsonl).
+
 ## Semantics and limits
 
 - **Session-level taint.** Labels apply to the whole session, not to
@@ -207,10 +309,9 @@ text.
 - **Replay** recomputes labels from the log. A call the recording blocked but
   the new policy allows is assumed to have returned output, and a call the new
   policy would `ask` about is assumed approved (which can only add taint).
-- **Not yet supported:** MCP resources and prompts (only tools are proxied),
-  server-to-client requests from upstream servers (their sampling and
-  elicitation requests are refused), HTTP transport, and OS-level
-  enforcement so tools can't get around the proxy.
+- **Not yet supported:** server-to-client requests from upstream servers
+  (their sampling and elicitation requests are refused), resource
+  subscriptions, the old SSE transport, and sandboxing outside Linux.
 
 ## Website
 
