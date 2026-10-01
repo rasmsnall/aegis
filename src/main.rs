@@ -114,7 +114,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let resources = ResourceStore::open(&config.state.path, config.resources.clone())?;
             let mut upstreams = Vec::new();
             for server in &config.servers {
-                upstreams.push(Upstream::spawn(server, config.limits.max_message_bytes).await?);
+                upstreams.push(Upstream::open(server, config.limits.max_message_bytes).await?);
             }
             let options = proxy::Options {
                 audit: Some(audit),
@@ -245,7 +245,7 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     let mut warnings = Vec::new();
     let mut upstreams = Vec::new();
     for server in &config.servers {
-        match Upstream::spawn(server, config.limits.max_message_bytes).await {
+        match Upstream::open(server, config.limits.max_message_bytes).await {
             Ok(u) => upstreams.push(u),
             Err(e) => warnings.push(format!("server {:?} did not start: {e:#}", server.name)),
         }
@@ -254,11 +254,27 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     for (server, e) in &listing.failures {
         warnings.push(format!("server {server:?} did not list its tools: {e:#}"));
     }
-    let names: Vec<&str> = listing
+    let mut names: Vec<String> = listing
         .tools
         .iter()
-        .filter_map(|t| t["name"].as_str())
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
+    // Resource reads and prompts are checked like tool calls, under these names.
+    for upstream in &upstreams {
+        for (capability, pseudo) in [
+            ("resources", proxy::READ_RESOURCE),
+            ("prompts", proxy::GET_PROMPT),
+        ] {
+            if upstream.supports(capability) {
+                names.push(format!(
+                    "{}{}{pseudo}",
+                    upstream.name,
+                    aegis::config::NAMESPACE_SEP
+                ));
+            }
+        }
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
 
     let policy = config.policy();
     let rows: Vec<(&str, String, String)> = names
@@ -382,28 +398,37 @@ async fn probe_tools(
 ) -> BTreeMap<String, Vec<String>> {
     let mut found = BTreeMap::new();
     for (original, server) in servers {
-        let Some(command) = server.command.clone().filter(|c| !c.is_empty()) else {
+        let command = server.command.clone().filter(|c| !c.is_empty());
+        let url = server.url.clone().filter(|_| command.is_none());
+        if command.is_none() && url.is_none() {
             continue;
-        };
+        }
         let config = aegis::config::ServerConfig {
             name: aegis::init::sanitize_name(original),
-            command,
+            command: command.unwrap_or_default(),
             args: server.args.clone(),
             env: server.env.clone(),
+            headers: if url.is_some() {
+                server.headers.clone()
+            } else {
+                BTreeMap::new()
+            },
+            url,
+            sandbox: None,
             startup_timeout_secs: 10,
             call_timeout_secs: 10,
         };
-        let listed =
-            match Upstream::spawn(&config, aegis::upstream::DEFAULT_MAX_MESSAGE_BYTES).await {
-                Ok(upstream) => {
-                    let listing = proxy::list_tools(&[upstream]).await;
-                    match listing.failures.into_iter().next() {
-                        Some((_, e)) => Err(e),
-                        None => Ok(listing.tools),
-                    }
+        let listed = match Upstream::open(&config, aegis::upstream::DEFAULT_MAX_MESSAGE_BYTES).await
+        {
+            Ok(upstream) => {
+                let listing = proxy::list_tools(&[upstream]).await;
+                match listing.failures.into_iter().next() {
+                    Some((_, e)) => Err(e),
+                    None => Ok(listing.tools),
                 }
-                Err(e) => Err(e),
-            };
+            }
+            Err(e) => Err(e),
+        };
         match listed {
             Ok(tools) => {
                 let prefix = format!("{}{}", config.name, aegis::config::NAMESPACE_SEP);

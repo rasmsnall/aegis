@@ -30,9 +30,27 @@ async fn fake_server(stream: DuplexStream, tools: &'static [&'static str], mute:
         let result = match msg["method"].as_str().unwrap() {
             "initialize" => json!({
                 "protocolVersion": "2025-06-18",
-                "capabilities": { "tools": {} },
+                "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
                 "serverInfo": { "name": "fake", "version": "0" },
             }),
+            // Each server has one resource, named after its first tool.
+            "resources/list" => json!({
+                "resources": [{ "uri": format!("mem://{}", tools[0]), "name": "doc" }]
+            }),
+            "resources/read" => {
+                let uri = msg["params"]["uri"].as_str().unwrap();
+                assert_eq!(
+                    uri,
+                    format!("mem://{}", tools[0]),
+                    "routed to the wrong server"
+                );
+                json!({ "contents": [{ "uri": uri, "text": format!("contents of {uri}") }] })
+            }
+            "prompts/list" => json!({ "prompts": [{ "name": "greet" }] }),
+            "prompts/get" => {
+                assert_eq!(msg["params"]["name"], "greet");
+                json!({ "messages": [{ "role": "user", "content": { "type": "text", "text": "hi" } }] })
+            }
             "tools/list" => json!({
                 "tools": tools.iter().map(|t| json!({ "name": t, "inputSchema": { "type": "object" } })).collect::<Vec<_>>()
             }),
@@ -622,4 +640,93 @@ async fn pages_from_trusted_hosts_keep_the_session_clean() {
         .call("shell__exec", json!({ "cmd": "cargo test" }))
         .await;
     assert_eq!(r["result"]["isError"], true, "{r}");
+}
+
+#[tokio::test]
+async fn resources_and_prompts_are_labelled_and_checked() {
+    let config: Config = toml::from_str(
+        r#"
+        [[source]]
+        tool = "web__*"
+        labels = ["untrusted"]
+
+        [[source]]
+        tool = "shell__*"
+        labels = []
+
+        [[rule]]
+        tool = "shell__*"
+        when_context_has = ["untrusted"]
+        action = "deny"
+        "#,
+    )
+    .unwrap();
+    let upstreams = vec![
+        upstream("web", &["fetch"]).await,
+        upstream("shell", &["exec"]).await,
+    ];
+    let proxy = Proxy::new(upstreams, config.policy(), Options::default()).unwrap();
+    let (mut agent, served) = start(proxy);
+    let init = agent
+        .request(
+            "initialize",
+            json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+        )
+        .await;
+    assert!(init["result"]["capabilities"]["resources"].is_object());
+    assert!(init["result"]["capabilities"]["prompts"].is_object());
+
+    let list = agent.request("resources/list", json!({})).await;
+    let resources = list["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0]["name"], "web__doc");
+
+    let prompts = agent.request("prompts/list", json!({})).await;
+    assert_eq!(prompts["result"]["prompts"][1]["name"], "shell__greet");
+
+    // A clean context lets the shell server's prompt and resource through.
+    let r = agent
+        .request("prompts/get", json!({ "name": "shell__greet" }))
+        .await;
+    assert_eq!(r["result"]["messages"][0]["content"]["text"], "hi");
+    let r = agent
+        .request("resources/read", json!({ "uri": "mem://exec" }))
+        .await;
+    assert_eq!(r["result"]["contents"][0]["text"], "contents of mem://exec");
+
+    // Reading the web server's resource taints the session...
+    let r = agent
+        .request("resources/read", json!({ "uri": "mem://fetch" }))
+        .await;
+    assert_eq!(
+        r["result"]["contents"][0]["text"],
+        "contents of mem://fetch"
+    );
+
+    // ...so the shell server is now off limits, for tools and resources alike.
+    let r = agent.call("shell__exec", json!({})).await;
+    assert_eq!(r["result"]["isError"], true);
+    let r = agent
+        .request("resources/read", json!({ "uri": "mem://exec" }))
+        .await;
+    assert_eq!(r["error"]["code"], -32001);
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shell__resources/read"),
+        "{r}"
+    );
+    let r = agent
+        .request("prompts/get", json!({ "name": "shell__greet" }))
+        .await;
+    assert_eq!(r["error"]["code"], -32001);
+
+    let r = agent
+        .request("resources/read", json!({ "uri": "mem://unknown" }))
+        .await;
+    assert_eq!(r["error"]["code"], -32002);
+
+    drop(agent);
+    served.await.unwrap().unwrap();
 }

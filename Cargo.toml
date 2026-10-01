@@ -27,7 +27,7 @@ required-features = ["runtime"]
 [features]
 default = ["runtime"]
 # Everything beyond the pure policy engine: the proxy, audit log and CLI.
-runtime = ["dep:anyhow", "dep:clap", "dep:hex", "dep:hmac", "dep:sha2", "dep:tokio", "dep:toml"]
+runtime = ["dep:anyhow", "dep:clap", "dep:hex", "dep:hmac", "dep:libc", "dep:reqwest", "dep:rustls", "dep:sha2", "dep:tokio", "dep:toml"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -36,10 +36,16 @@ anyhow = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 hex = { version = "0.4", optional = true }
 hmac = { version = "0.12", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider", "system-proxy"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 sha2 = { version = "0.10", optional = true }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"], optional = true }
 toml = { version = "0.8", optional = true }
 url = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Landlock system calls for `[server.sandbox]`.
+libc = { version = "0.2", optional = true }
 
 [profile.release]
 # Keeps the WebAssembly build small.
