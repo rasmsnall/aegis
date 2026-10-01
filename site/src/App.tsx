@@ -5,7 +5,7 @@ import { Playground } from "./Playground.tsx";
 import { Steps } from "./Steps.tsx";
 
 const REPO = "https://github.com/rasmsnall/aegis";
-const INSTALL = "cargo install mcp-aegis";
+const INSTALL = "cargo install --git https://github.com/rasmsnall/aegis";
 
 const CONFIG = `[[server]]
 name = "web"
