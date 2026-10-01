@@ -2,7 +2,8 @@ name: Release
 
 # Publishes the version in Cargo.toml: runs the tests, publishes the crate to
 # crates.io, and creates a GitHub release (and its v<version> tag) with that
-# version's section of CHANGELOG.md.
+# version's section of CHANGELOG.md, then attaches prebuilt binaries to it
+# (which install.sh downloads).
 #
 # Start it by pushing a tag matching Cargo.toml (git push origin v0.1.0), or
 # from the Actions tab ("Run workflow" on main), which creates the tag for you.
@@ -18,6 +19,8 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -52,6 +55,65 @@ jobs:
         run: |
           # This version's section of CHANGELOG.md, without its heading.
           awk -v v="## $VERSION" '$0 == v {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
-          printf '\nInstall with `cargo install mcp-aegis`.\n' >> notes.md
+          cat >> notes.md <<'EOF'
+
+          Install a prebuilt binary (Linux, macOS):
+
+              curl -fsSL https://raw.githubusercontent.com/rasmsnall/aegis/main/install.sh | sh
+
+          or build it with `cargo install mcp-aegis`. Windows binaries are attached below.
+          EOF
           # Creates the tag at this commit if it doesn't exist yet.
           gh release create "$TAG" --target "$GITHUB_SHA" --title "aegis $TAG" --notes-file notes.md
+
+  binaries:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.publish.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --bin aegis --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="aegis-$TARGET"
+          mkdir "$name"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "target/$TARGET/release/aegis.exe" "$name/"
+            7z a "$name.zip" "$name" >/dev/null
+            archive="$name.zip"
+          else
+            cp "target/$TARGET/release/aegis" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.publish.outputs.tag }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
