@@ -28,6 +28,8 @@ pub mod resources;
 pub mod sandbox;
 #[cfg(feature = "runtime")]
 pub mod upstream;
+#[cfg(feature = "runtime")]
+pub mod watch;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;

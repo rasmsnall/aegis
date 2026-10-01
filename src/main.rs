@@ -82,6 +82,14 @@ enum Command {
         #[arg(long)]
         key_file: Option<PathBuf>,
     },
+    /// Follow an audit log live, printing each call and decision.
+    Watch {
+        #[arg(default_value = "aegis-audit.jsonl")]
+        log: PathBuf,
+        /// How many earlier entries to show first.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
     /// Show which recorded tool calls a policy would decide differently.
     Replay {
         log: PathBuf,
@@ -170,6 +178,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             replace,
             no_probe,
         } => init(&from, &config, force, replace, !no_probe).await,
+        Command::Watch { log, lines } => {
+            aegis::watch::follow(&log, lines, aegis::watch::Style::detect()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Report {
             log,
             output,
