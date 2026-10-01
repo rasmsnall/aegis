@@ -70,31 +70,7 @@ impl ResourceRule {
     }
 }
 
-/// Resolves `.`, `..` and repeated separators without touching the disk.
-pub fn normalize_path(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let absolute = path.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                if matches!(parts.last(), Some(p) if *p != "..") {
-                    parts.pop();
-                } else if !absolute {
-                    parts.push("..");
-                }
-            }
-            p => parts.push(p),
-        }
-    }
-    let joined = parts.join("/");
-    match (absolute, joined.is_empty()) {
-        (true, _) => format!("/{joined}"),
-        (false, true) => ".".into(),
-        (false, false) => joined,
-    }
-}
+pub use crate::labels::normalize_path;
 
 /// Labels of resources written while a session held them, kept on disk.
 pub struct ResourceStore {
@@ -188,21 +164,6 @@ mod tests {
 
     fn untrusted() -> LabelSet {
         ["untrusted".to_string()].into()
-    }
-
-    #[test]
-    fn normalizes_paths() {
-        for (input, want) in [
-            ("src/./a/../login.tsx", "src/login.tsx"),
-            ("src//login.tsx", "src/login.tsx"),
-            ("./src/login.tsx", "src/login.tsx"),
-            ("/a/../../etc/passwd", "/etc/passwd"),
-            ("../x/../y", "../y"),
-            ("src\\login.tsx", "src/login.tsx"),
-            ("./", "."),
-        ] {
-            assert_eq!(normalize_path(input), want, "{input}");
-        }
     }
 
     #[test]

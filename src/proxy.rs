@@ -307,7 +307,7 @@ impl Proxy {
         };
         let added = {
             let mut session = self.session.lock().await;
-            let mut added = session.observe_result(&self.policy, &name);
+            let mut added = session.observe_result(&self.policy, &name, &arguments);
             added.extend(session.add_labels(recalled.iter().cloned()));
             added
         };

@@ -70,6 +70,21 @@ labels = ["untrusted"]
 [[source]]                 # labels = [] marks output as trusted
 tool = "files__*"
 labels = []
+```
+
+Sources are checked in order and the first one that matches decides. A source
+can depend on the call's arguments, so specific trust goes before general
+distrust:
+
+```toml
+[[source]]                 # pages from these hosts are trusted
+tool = "web__fetch"
+labels = []
+hosts = ["docs.rs", "*.rust-lang.org"]   # host of the `url` argument
+
+[[source]]                 # every other page is not
+tool = "web__*"
+labels = ["untrusted"]
 
 [[rule]]                   # first matching rule decides; else [policy].default
 tool = "shell__*"
@@ -77,6 +92,22 @@ when_context_has = ["untrusted"]
 action = "deny"             # or "allow", or "ask" a person
 reason = "shell commands are disabled once untrusted content is in context"
 ```
+
+Conditions a source can have (all must hold):
+
+- `hosts`: the URL in the `url` argument (or `url_arg`) is on one of these
+  hosts. `*.rust-lang.org` means its subdomains. URLs are parsed, not pattern
+  matched, so `https://docs.rs@evil.com/` and `https://docs.rs.evil.com/` are
+  not docs.rs, and only `http` and `https` URLs count.
+- `paths`: the path in the `path` argument (or `path_arg`), normalized,
+  matches one of these patterns. `*` also matches across `/`, so `src/*`
+  covers everything under `src/`, and `src/../.env` is not under it.
+- `args`: each named argument (`a.b` for nested) is a string matching one of
+  its patterns, e.g. `args = { owner = ["rasmsnall"] }`.
+
+If a condition can't be checked (the argument is missing, or isn't a web
+URL) the source doesn't match, and the next one decides, down to
+`default_labels`.
 
 ### Asking a person
 
@@ -159,9 +190,8 @@ the arguments, `omit` drops them, and `full` keeps them as sent.
   policy would `ask` about is assumed approved (which can only add taint).
 - **Not yet supported:** MCP resources and prompts (only tools are proxied),
   server-to-client requests from upstream servers (their sampling and
-  elicitation requests are refused), HTTP transport, labels based on
-  arguments (e.g. trust by URL domain), and OS-level enforcement so tools
-  can't get around the proxy.
+  elicitation requests are refused), HTTP transport, and OS-level
+  enforcement so tools can't get around the proxy.
 
 ## Website
 

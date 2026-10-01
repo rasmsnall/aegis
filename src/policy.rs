@@ -13,10 +13,20 @@
 //! policy's `default_labels` (`untrusted` unless configured otherwise), so a
 //! newly added or renamed tool is never trusted by accident. A source with
 //! `labels = []` marks a tool's output as trusted.
+//!
+//! Sources, like rules, are checked in order and the first one that matches
+//! decides. A source can depend on the call's arguments (`hosts`, `paths`,
+//! `args`), so "pages from docs.rs are trusted" goes before "everything else
+//! from the web is untrusted". A condition that cannot be checked (the
+//! argument is missing, or isn't a web URL) does not match, so the call
+//! falls through to the next source, and in the end to `default_labels`.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::labels::{LabelSet, glob_match};
+use crate::labels::{LabelSet, glob_match, host_matches, normalize_path, url_host};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +54,87 @@ impl Action {
 pub struct Source {
     pub tool: String,
     pub labels: Vec<String>,
+    /// Only match when the URL in `url_arg` is on one of these hosts
+    /// (`docs.rs`, or `*.rust-lang.org` for its subdomains).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default = "default_url_arg")]
+    pub url_arg: String,
+    /// Only match when the path in `path_arg`, normalized, matches one of
+    /// these patterns (`*` also matches across `/`, so `src/*` covers `src/a/b`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default = "default_path_arg")]
+    pub path_arg: String,
+    /// Only match when each named argument (`a.b` looks inside objects) is a
+    /// string matching one of its patterns.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub args: BTreeMap<String, Vec<String>>,
+}
+
+fn default_url_arg() -> String {
+    "url".into()
+}
+
+fn default_path_arg() -> String {
+    "path".into()
+}
+
+/// The string at `key` (dotted for nested objects) in `arguments`.
+fn arg_str<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    key.split('.')
+        .try_fold(arguments, |v, part| v.get(part))?
+        .as_str()
+}
+
+impl Source {
+    /// A source with no argument conditions.
+    pub fn new(tool: impl Into<String>, labels: &[&str]) -> Self {
+        Self {
+            tool: tool.into(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            hosts: Vec::new(),
+            url_arg: default_url_arg(),
+            paths: Vec::new(),
+            path_arg: default_path_arg(),
+            args: BTreeMap::new(),
+        }
+    }
+
+    /// Whether this source depends on the call's arguments.
+    pub fn is_conditional(&self) -> bool {
+        !self.hosts.is_empty() || !self.paths.is_empty() || !self.args.is_empty()
+    }
+
+    /// Whether this source applies to a call of `tool` with `arguments`.
+    pub fn matches(&self, tool: &str, arguments: &Value) -> bool {
+        if !glob_match(&self.tool, tool) {
+            return false;
+        }
+        if !self.hosts.is_empty() {
+            let Some(host) = arg_str(arguments, &self.url_arg).and_then(url_host) else {
+                return false;
+            };
+            if !self.hosts.iter().any(|p| host_matches(p, &host)) {
+                return false;
+            }
+        }
+        if !self.paths.is_empty() {
+            let Some(path) = arg_str(arguments, &self.path_arg).map(normalize_path) else {
+                return false;
+            };
+            if !self
+                .paths
+                .iter()
+                .any(|p| glob_match(&normalize_path(p), &path))
+            {
+                return false;
+            }
+        }
+        self.args.iter().all(|(key, patterns)| {
+            arg_str(arguments, key).is_some_and(|v| patterns.iter().any(|p| glob_match(p, v)))
+        })
+    }
 }
 
 /// A rule over tool calls. The first rule that matches a call decides it.
@@ -123,21 +214,16 @@ impl Decision {
 }
 
 impl Policy {
-    /// Labels carried by the output of `tool`.
-    pub fn labels_for_result(&self, tool: &str) -> LabelSet {
-        let mut matched = false;
-        let mut labels = LabelSet::new();
-        for source in self.sources.iter().filter(|s| glob_match(&s.tool, tool)) {
-            matched = true;
-            labels.extend(source.labels.iter().cloned());
+    /// Labels carried by the output of a call to `tool` with `arguments`:
+    /// those of the first matching source, else `default_labels`.
+    pub fn labels_for_result(&self, tool: &str, arguments: &Value) -> LabelSet {
+        match self.sources.iter().find(|s| s.matches(tool, arguments)) {
+            Some(source) => source.labels.iter().cloned().collect(),
+            None => self.default_labels.iter().cloned().collect(),
         }
-        if !matched {
-            labels.extend(self.default_labels.iter().cloned());
-        }
-        labels
     }
 
-    /// Whether any source names `tool` explicitly.
+    /// Whether any source names `tool` explicitly (whatever its conditions).
     pub fn has_source_for(&self, tool: &str) -> bool {
         self.sources.iter().any(|s| glob_match(&s.tool, tool))
     }
@@ -196,9 +282,9 @@ impl Session {
 
     /// Records that the agent has seen the output of `tool`. Returns the labels
     /// that were newly added to the context.
-    pub fn observe_result(&mut self, policy: &Policy, tool: &str) -> LabelSet {
+    pub fn observe_result(&mut self, policy: &Policy, tool: &str, arguments: &Value) -> LabelSet {
         policy
-            .labels_for_result(tool)
+            .labels_for_result(tool, arguments)
             .into_iter()
             .filter(|l| self.context.insert(l.clone()))
             .collect()
@@ -222,6 +308,8 @@ impl Session {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SimCall {
     pub tool: String,
+    #[serde(default)]
+    pub arguments: Value,
     /// The person's answer if the policy asks about this call.
     #[serde(default)]
     pub approved: Option<bool>,
@@ -260,7 +348,7 @@ pub fn simulate(policy: &Policy, calls: &[SimCall]) -> Simulation {
             let runs = decision.runs();
             let added = if runs {
                 session
-                    .observe_result(policy, &call.tool)
+                    .observe_result(policy, &call.tool, &call.arguments)
                     .into_iter()
                     .collect()
             } else {
@@ -289,18 +377,9 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             sources: vec![
-                Source {
-                    tool: "web__*".into(),
-                    labels: vec!["untrusted".into()],
-                },
-                Source {
-                    tool: "files__*".into(),
-                    labels: vec![],
-                },
-                Source {
-                    tool: "shell__*".into(),
-                    labels: vec![],
-                },
+                Source::new("web__*", &["untrusted"]),
+                Source::new("files__*", &[]),
+                Source::new("shell__*", &[]),
             ],
             rules: vec![
                 Rule {
@@ -324,19 +403,31 @@ mod tests {
     #[test]
     fn unlisted_tools_get_default_labels() {
         let mut policy = policy();
-        assert!(policy.labels_for_result("files__read").is_empty());
-        assert!(policy.labels_for_result("mail__read").contains("untrusted"));
+        assert!(
+            policy
+                .labels_for_result("files__read", &serde_json::Value::Null)
+                .is_empty()
+        );
+        assert!(
+            policy
+                .labels_for_result("mail__read", &serde_json::Value::Null)
+                .contains("untrusted")
+        );
         assert!(!policy.has_source_for("mail__read"));
 
         let mut session = Session::default();
-        session.observe_result(&policy, "mail__read");
+        session.observe_result(&policy, "mail__read", &serde_json::Value::Null);
         assert_eq!(
             session.check_call(&policy, "shell__exec").action,
             Action::Deny
         );
 
         policy.default_labels.clear();
-        assert!(policy.labels_for_result("mail__read").is_empty());
+        assert!(
+            policy
+                .labels_for_result("mail__read", &serde_json::Value::Null)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -344,7 +435,7 @@ mod tests {
         let mut policy = policy();
         policy.rules[0].action = Action::Ask;
         let mut session = Session::default();
-        session.observe_result(&policy, "web__fetch");
+        session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
         let mut d = session.check_call(&policy, "shell__exec");
         assert_eq!(d.action, Action::Ask);
         assert!(!d.runs());
@@ -360,7 +451,7 @@ mod tests {
     fn block_message_explains_itself() {
         let policy = policy();
         let mut session = Session::default();
-        session.observe_result(&policy, "web__fetch");
+        session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
         let text = session
             .check_call(&policy, "shell__exec")
             .message("shell__exec");
@@ -378,10 +469,12 @@ mod tests {
             vec![
                 SimCall {
                     tool: "web__fetch".into(),
+                    arguments: Value::Null,
                     approved: None,
                 },
                 SimCall {
                     tool: "shell__exec".into(),
+                    arguments: Value::Null,
                     approved,
                 },
             ]
@@ -403,6 +496,54 @@ mod tests {
     }
 
     #[test]
+    fn first_matching_source_decides_and_can_trust_by_host() {
+        use serde_json::json;
+        let mut docs = Source::new("web__fetch", &[]);
+        docs.hosts = vec!["docs.rs".into(), "*.rust-lang.org".into()];
+        let mut src = Source::new("files__read*", &[]);
+        src.paths = vec!["src/*".into()];
+        let mut issue = Source::new("github__get_issue", &[]);
+        issue.args = [("owner".to_string(), vec!["rasmsnall".to_string()])].into();
+        let policy = Policy {
+            sources: vec![docs, Source::new("web__*", &["untrusted"]), src, issue],
+            rules: vec![],
+            default: Action::Allow,
+            default_labels: vec!["untrusted".into()],
+        };
+        let labels = |tool: &str, args: serde_json::Value| policy.labels_for_result(tool, &args);
+
+        assert!(labels("web__fetch", json!({ "url": "https://docs.rs/serde" })).is_empty());
+        assert!(
+            labels(
+                "web__fetch",
+                json!({ "url": "https://doc.rust-lang.org/std" })
+            )
+            .is_empty()
+        );
+        for bad in [
+            json!({ "url": "https://docs.rs@evil.com/" }),
+            json!({ "url": "https://docs.rs.evil.com/" }),
+            json!({ "url": "https://evil.com/?next=https://docs.rs" }),
+            json!({ "url": "file:///etc/passwd" }),
+            json!({ "uri": "https://docs.rs/" }), // wrong argument name
+            json!({}),
+        ] {
+            assert!(
+                labels("web__fetch", bad.clone()).contains("untrusted"),
+                "{bad}"
+            );
+        }
+
+        assert!(labels("files__read", json!({ "path": "src/a/b.rs" })).is_empty());
+        assert!(labels("files__read", json!({ "path": "./src/x/../main.rs" })).is_empty());
+        // Escaping src/ falls through to the default.
+        assert!(labels("files__read", json!({ "path": "src/../.env" })).contains("untrusted"));
+
+        assert!(labels("github__get_issue", json!({ "owner": "rasmsnall" })).is_empty());
+        assert!(labels("github__get_issue", json!({ "owner": "someone" })).contains("untrusted"));
+    }
+
+    #[test]
     fn rules_for_ignores_label_conditions() {
         let policy = policy();
         assert_eq!(policy.rules_for("shell__exec"), vec![1]);
@@ -420,7 +561,7 @@ mod tests {
             Action::Allow
         );
 
-        let added = session.observe_result(&policy, "web__fetch");
+        let added = session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
         assert!(added.contains("untrusted"));
 
         let d = session.check_call(&policy, "shell__exec");
@@ -439,9 +580,13 @@ mod tests {
     fn taint_is_sticky() {
         let policy = policy();
         let mut session = Session::default();
-        session.observe_result(&policy, "web__fetch");
-        assert!(session.observe_result(&policy, "web__fetch").is_empty());
-        session.observe_result(&policy, "files__read");
+        session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
+        assert!(
+            session
+                .observe_result(&policy, "web__fetch", &serde_json::Value::Null)
+                .is_empty()
+        );
+        session.observe_result(&policy, "files__read", &serde_json::Value::Null);
         assert_eq!(
             session.check_call(&policy, "shell__exec").action,
             Action::Deny

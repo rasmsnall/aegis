@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0
+
+- **Trust by host, path or argument.** A `[[source]]` can depend on the
+  call's arguments: `hosts` (the host of a URL argument, parsed properly, so
+  lookalikes like `https://docs.rs@evil.com/` don't count), `paths`
+  (normalized, so `src/../.env` is not under `src/*`) and `args` (patterns on
+  any string argument). Trusting documentation sites no longer means trusting
+  the whole web.
+- **Sources are now first-match**, like rules: the first source that matches
+  a call decides its labels. Previously the labels of every matching source
+  were combined. Put specific sources (trusted hosts) before general ones.
+- `aegis tools` shows argument-dependent labels, and `aegis replay` checks
+  them against the logged arguments (treating redacted, hashed or omitted
+  arguments as not matching).
+- The website's playground trusts docs.rs and the Rust docs, and has a
+  "Read the Rust docs" call to show it.
+
 ## 0.1.0
 
 First release of aegis, an information-flow firewall for AI agent tool calls.

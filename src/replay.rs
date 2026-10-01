@@ -1,7 +1,9 @@
 //! Re-evaluates a recorded session under a different policy, to answer "what
 //! would this policy have changed?" before rolling it out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+use serde_json::Value;
 
 use crate::audit::{Entry, Event};
 use crate::policy::{Action, Decision, Policy, Session};
@@ -29,23 +31,35 @@ pub struct Report {
 /// the recording ran but `policy` would not has its result ignored. A call
 /// `policy` would `ask` about is assumed to be approved, which can only add
 /// taint, never hide it.
+///
+/// Sources that depend on arguments are checked against the arguments as
+/// logged. With `[audit] arguments = "hash"` or `"omit"`, or an argument that
+/// was redacted, those conditions can't match and the output counts as
+/// untrusted (or whatever `default_labels` says), never as trusted.
 pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
     let mut report = Report::default();
     let mut session = Session::default();
     // Results to ignore, per tool, because the replayed policy denied the call.
     let mut suppressed: HashMap<&str, usize> = HashMap::new();
+    // Arguments of recorded calls that ran, per tool, waiting for their result.
+    let mut awaiting: HashMap<&str, VecDeque<&Value>> = HashMap::new();
 
     for entry in entries {
         match &entry.event {
             Event::SessionStart { .. } => {
                 session = Session::default();
                 suppressed.clear();
+                awaiting.clear();
             }
             Event::ToolCall {
                 tool,
+                arguments,
                 decision: recorded,
                 ..
             } => {
+                if recorded.runs() {
+                    awaiting.entry(tool).or_default().push_back(arguments);
+                }
                 report.calls += 1;
                 let replayed = session.check_call(policy, tool);
                 let would_run = replayed.action != Action::Deny;
@@ -54,7 +68,7 @@ pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
                         *suppressed.entry(tool).or_default() += 1;
                     }
                     (false, true) => {
-                        session.observe_result(policy, tool);
+                        session.observe_result(policy, tool, arguments);
                     }
                     _ => {}
                 }
@@ -69,10 +83,14 @@ pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
             }
             Event::SessionEnd => {}
             Event::ToolResult { tool, recalled, .. } => {
+                let arguments = awaiting
+                    .get_mut(tool.as_str())
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(&Value::Null);
                 if let Some(n) = suppressed.get_mut(tool.as_str()).filter(|n| **n > 0) {
                     *n -= 1;
                 } else {
-                    session.observe_result(policy, tool);
+                    session.observe_result(policy, tool, arguments);
                     session.add_labels(recalled.iter().cloned());
                 }
             }
@@ -98,11 +116,15 @@ mod tests {
     }
 
     fn call(seq: u64, tool: &str, action: Action) -> Entry {
+        call_with(seq, tool, action, serde_json::Value::Null)
+    }
+
+    fn call_with(seq: u64, tool: &str, action: Action, arguments: serde_json::Value) -> Entry {
         entry(
             seq,
             Event::ToolCall {
                 tool: tool.into(),
-                arguments: serde_json::Value::Null,
+                arguments,
                 context: vec![],
                 decision: Decision {
                     action,
@@ -140,10 +162,7 @@ mod tests {
             result(6, "shell__exec"),
         ];
         let strict = Policy {
-            sources: vec![Source {
-                tool: "web__*".into(),
-                labels: vec!["untrusted".into()],
-            }],
+            sources: vec![Source::new("web__*", &["untrusted"])],
             rules: vec![Rule {
                 tool: "shell__*".into(),
                 when_context_has: vec!["untrusted".into()],
@@ -167,10 +186,7 @@ mod tests {
             call(1, "shell__exec", Action::Allow),
         ];
         let policy = Policy {
-            sources: vec![Source {
-                tool: "web__*".into(),
-                labels: vec!["untrusted".into()],
-            }],
+            sources: vec![Source::new("web__*", &["untrusted"])],
             rules: vec![Rule {
                 tool: "shell__*".into(),
                 when_context_has: vec!["untrusted".into()],
@@ -184,5 +200,51 @@ mod tests {
         // web__fetch is now allowed, so its output taints the later shell call.
         let tools: Vec<_> = report.changes.iter().map(|c| c.tool.as_str()).collect();
         assert_eq!(tools, ["web__fetch", "shell__exec"]);
+    }
+
+    #[test]
+    fn replay_checks_host_conditions_against_logged_arguments() {
+        use serde_json::json;
+        // Recorded with no policy: everything allowed.
+        let log = vec![
+            call_with(
+                0,
+                "web__fetch",
+                Action::Allow,
+                json!({ "url": "https://docs.rs/x" }),
+            ),
+            result(1, "web__fetch"),
+            call(2, "shell__exec", Action::Allow),
+            result(3, "shell__exec"),
+            call_with(
+                4,
+                "web__fetch",
+                Action::Allow,
+                json!({ "url": "https://evil.example/" }),
+            ),
+            result(5, "web__fetch"),
+            call(6, "shell__exec", Action::Allow),
+        ];
+        let mut docs = Source::new("web__fetch", &[]);
+        docs.hosts = vec!["docs.rs".into()];
+        let policy = Policy {
+            sources: vec![
+                docs,
+                Source::new("web__*", &["untrusted"]),
+                Source::new("shell__*", &[]),
+            ],
+            rules: vec![Rule {
+                tool: "shell__*".into(),
+                when_context_has: vec!["untrusted".into()],
+                action: Action::Deny,
+                reason: None,
+            }],
+            default: Action::Allow,
+            default_labels: vec!["untrusted".into()],
+        };
+        let report = replay(&log, &policy);
+        // Only the shell call after the untrusted page changes.
+        let changed: Vec<_> = report.changes.iter().map(|c| c.seq).collect();
+        assert_eq!(changed, [6]);
     }
 }

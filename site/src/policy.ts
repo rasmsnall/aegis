@@ -6,6 +6,8 @@ export type Action = "allow" | "deny" | "ask";
 export interface Source {
   tool: string;
   labels: string[];
+  /** Only when the `url` argument's host is one of these. */
+  hosts?: string[];
 }
 
 export interface Rule {
@@ -29,7 +31,9 @@ export function toToml(policy: Policy): string {
   const list = (xs: string[]) => `[${xs.map(q).join(", ")}]`;
   const parts = [`[policy]\ndefault = ${q(policy.default)}\ndefault_labels = ${list(policy.defaultLabels)}`];
   for (const s of policy.sources) {
-    parts.push(`[[source]]\ntool = ${q(s.tool)}\nlabels = ${list(s.labels)}`);
+    let source = `[[source]]\ntool = ${q(s.tool)}\nlabels = ${list(s.labels)}`;
+    if (s.hosts?.length) source += `\nhosts = ${list(s.hosts)}`;
+    parts.push(source);
   }
   for (const r of policy.rules) {
     let rule = `[[rule]]\ntool = ${q(r.tool)}\n`;
@@ -45,6 +49,7 @@ export const examplePolicy: Policy = {
   default: "allow",
   defaultLabels: ["untrusted"],
   sources: [
+    { tool: "web__fetch", labels: [], hosts: ["docs.rs", "*.rust-lang.org"] },
     { tool: "web__*", labels: ["untrusted", "external"] },
     { tool: "github__get_issue*", labels: ["untrusted"] },
     { tool: "files__*", labels: [] },

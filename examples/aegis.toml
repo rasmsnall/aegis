@@ -45,6 +45,13 @@ call_timeout_secs = 120
 # Once a session has seen output with a label, the label stays for the rest
 # of the session.
 
+# Sources are checked in order; the first that matches decides. Pages from
+# these hosts are trusted, so reading documentation doesn't block anything.
+[[source]]
+tool = "web__fetch"
+labels = []
+hosts = ["docs.rs", "*.rust-lang.org"]
+
 [[source]]
 tool = "web__*"
 labels = ["untrusted", "external"]

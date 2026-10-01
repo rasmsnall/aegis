@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 use aegis::audit::{self, AuditKey, AuditLog};
 use aegis::config::Config;
+use aegis::labels::glob_match;
 use aegis::policy::{Action, Policy};
 use aegis::proxy::{self, Proxy};
 use aegis::replay;
@@ -188,21 +189,22 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
         .collect();
 
     let policy = config.policy();
-    let width = names.iter().map(|n| n.len()).max().unwrap_or(4).max(4);
-    println!("{:width$}  {:28}  RULES", "TOOL", "OUTPUT LABELS");
-    for name in &names {
-        println!(
-            "{name:width$}  {:28}  {}",
-            describe_labels(&policy, name),
-            describe_rules(&policy, name)
-        );
+    let rows: Vec<(&str, String, String)> = names
+        .iter()
+        .map(|n| (*n, describe_labels(&policy, n), describe_rules(&policy, n)))
+        .collect();
+    let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+    let labels_width = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(13);
+    println!(
+        "{:width$}  {:labels_width$}  RULES",
+        "TOOL", "OUTPUT LABELS"
+    );
+    for (name, labels, rules) in &rows {
+        println!("{name:width$}  {labels:labels_width$}  {rules}");
     }
 
     for (i, source) in policy.sources.iter().enumerate() {
-        if !names
-            .iter()
-            .any(|n| aegis::labels::glob_match(&source.tool, n))
-        {
+        if !names.iter().any(|n| glob_match(&source.tool, n)) {
             warnings.push(format!(
                 "source #{} ({:?}) matches no tool",
                 i + 1,
@@ -211,10 +213,7 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
         }
     }
     for (i, rule) in policy.rules.iter().enumerate() {
-        if !names
-            .iter()
-            .any(|n| aegis::labels::glob_match(&rule.tool, n))
-        {
+        if !names.iter().any(|n| glob_match(&rule.tool, n)) {
             warnings.push(format!("rule #{} ({:?}) matches no tool", i + 1, rule.tool));
         }
     }
@@ -234,18 +233,49 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
     })
 }
 
+/// The labels `tool`'s output gets: those of the first unconditional source
+/// that names it (or the default), plus any argument-dependent sources
+/// checked before it, e.g. `untrusted; trusted if url host docs.rs`.
 fn describe_labels(policy: &Policy, tool: &str) -> String {
-    let labels: Vec<String> = policy.labels_for_result(tool).into_iter().collect();
-    let text = if labels.is_empty() {
-        "trusted".to_string()
-    } else {
-        labels.join(", ")
+    let names = |labels: &[String]| {
+        if labels.is_empty() {
+            "trusted".to_string()
+        } else {
+            labels.join(", ")
+        }
     };
-    if policy.has_source_for(tool) {
-        text
-    } else {
-        format!("{text} (default)")
+    let mut conditional = Vec::new();
+    let mut base = None;
+    for source in policy.sources.iter().filter(|s| glob_match(&s.tool, tool)) {
+        if !source.is_conditional() {
+            base = Some(names(&source.labels));
+            break;
+        }
+        let mut conditions = Vec::new();
+        if !source.hosts.is_empty() {
+            conditions.push(format!(
+                "{} host {}",
+                source.url_arg,
+                source.hosts.join("|")
+            ));
+        }
+        if !source.paths.is_empty() {
+            conditions.push(format!("{} {}", source.path_arg, source.paths.join("|")));
+        }
+        for (key, patterns) in &source.args {
+            conditions.push(format!("{key}={}", patterns.join("|")));
+        }
+        conditional.push(format!(
+            "{} if {}",
+            names(&source.labels),
+            conditions.join(" and ")
+        ));
     }
+    let base = base.unwrap_or_else(|| format!("{} (default)", names(&policy.default_labels)));
+    std::iter::once(base)
+        .chain(conditional)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn describe_rules(policy: &Policy, tool: &str) -> String {

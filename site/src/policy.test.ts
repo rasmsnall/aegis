@@ -26,6 +26,14 @@ test("the engine blocks shell once untrusted data is read", () => {
   assert.match(blocked.message!, /^aegis blocked this call to shell__exec \(rule #1\) because this session has read data labelled untrusted/);
 });
 
+test("pages from trusted hosts stay clean; everything else from the web doesn't", () => {
+  const fetch = (url: string) => simulate(examplePolicy, [{ tool: "web__fetch", arguments: { url } }]).context;
+  assert.deepEqual(fetch("https://docs.rs/serde"), []);
+  assert.deepEqual(fetch("https://doc.rust-lang.org/std/"), []);
+  assert.deepEqual(fetch("https://docs.rs@evil.example/"), ["external", "untrusted"]);
+  assert.deepEqual(fetch("https://example.com/fix"), ["external", "untrusted"]);
+});
+
 test("files are trusted, unlisted tools are not", () => {
   assert.deepEqual(simulate(examplePolicy, calls("files__read")).context, []);
   assert.deepEqual(simulate(examplePolicy, calls("mail__read")).context, ["untrusted"]);
@@ -56,13 +64,17 @@ test("toToml emits the config format aegis reads", () => {
   const toml = toToml({
     default: "deny",
     defaultLabels: ["untrusted"],
-    sources: [{ tool: "web__*", labels: ["untrusted"] }],
+    sources: [
+      { tool: "web__fetch", labels: [], hosts: ["docs.rs"] },
+      { tool: "web__*", labels: ["untrusted"] },
+    ],
     rules: [{ tool: "shell__*", whenContextHas: ["untrusted"], action: "ask", reason: 'no "shell"' }],
   });
   assert.equal(
     toml,
     [
       '[policy]\ndefault = "deny"\ndefault_labels = ["untrusted"]',
+      '[[source]]\ntool = "web__fetch"\nlabels = []\nhosts = ["docs.rs"]',
       '[[source]]\ntool = "web__*"\nlabels = ["untrusted"]',
       '[[rule]]\ntool = "shell__*"\nwhen_context_has = ["untrusted"]\naction = "ask"\nreason = "no \\"shell\\""',
     ].join("\n\n"),

@@ -233,6 +233,17 @@ impl Config {
         if self.limits.max_message_bytes < 1024 {
             bail!("[limits] max_message_bytes must be at least 1024");
         }
+        for (i, source) in self.sources.iter().enumerate() {
+            for host in &source.hosts {
+                let bare = host.strip_prefix("*.").unwrap_or(host);
+                if bare.is_empty() || bare.contains(['/', ':', '*', '@', ' ']) {
+                    bail!(
+                        "source #{} host {host:?} must be a host name like \"docs.rs\" or \"*.rust-lang.org\", without scheme, port or path",
+                        i + 1
+                    );
+                }
+            }
+        }
         for (i, r) in self.resources.iter().enumerate() {
             if r.key.is_empty() || r.key.split('.').any(str::is_empty) {
                 bail!(
@@ -283,12 +294,45 @@ mod tests {
     }
 
     #[test]
+    fn host_patterns_are_validated() {
+        let source = |host: &str| {
+            toml::from_str::<Config>(&format!(
+                "[[source]]\ntool = \"web__*\"\nlabels = []\nhosts = [{host:?}]"
+            ))
+            .unwrap()
+        };
+        for bad in [
+            "https://docs.rs",
+            "docs.rs/x",
+            "docs.rs:443",
+            "*",
+            "*.",
+            "a*.b",
+            "",
+        ] {
+            assert!(source(bad).validate().is_err(), "{bad:?} accepted");
+        }
+        for good in ["docs.rs", "*.rust-lang.org", "localhost"] {
+            source(good).validate().unwrap();
+        }
+    }
+
+    #[test]
     fn unlisted_tools_are_untrusted_by_default() {
         let config: Config = toml::from_str("").unwrap();
         let policy = config.policy();
-        assert!(policy.labels_for_result("any__tool").contains("untrusted"));
+        assert!(
+            policy
+                .labels_for_result("any__tool", &serde_json::Value::Null)
+                .contains("untrusted")
+        );
 
         let config: Config = toml::from_str("[policy]\ndefault_labels = []").unwrap();
-        assert!(config.policy().labels_for_result("any__tool").is_empty());
+        assert!(
+            config
+                .policy()
+                .labels_for_result("any__tool", &serde_json::Value::Null)
+                .is_empty()
+        );
     }
 }

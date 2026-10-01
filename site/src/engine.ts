@@ -7,6 +7,7 @@ import type { Action, Policy } from "./policy.ts";
 
 export interface Call {
   tool: string;
+  arguments?: Record<string, unknown>;
   /** The person's answer, if the policy asks about this call. */
   approved?: boolean;
 }

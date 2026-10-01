@@ -559,3 +559,67 @@ async fn secrets_in_arguments_are_redacted_in_the_log() {
     assert!(!log.contains("Bearer abc"), "{log}");
     assert!(log.contains("[redacted]") && log.contains("https://api.example"));
 }
+
+#[tokio::test]
+async fn pages_from_trusted_hosts_keep_the_session_clean() {
+    let config: Config = toml::from_str(
+        r#"
+        [[source]]
+        tool = "web__fetch"
+        labels = []
+        hosts = ["docs.rs", "*.rust-lang.org"]
+
+        [[source]]
+        tool = "web__*"
+        labels = ["untrusted"]
+
+        [[source]]
+        tool = "shell__*"
+        labels = []
+
+        [[rule]]
+        tool = "shell__*"
+        when_context_has = ["untrusted"]
+        action = "deny"
+        "#,
+    )
+    .unwrap();
+    config.validate().unwrap();
+    let upstreams = vec![
+        upstream("web", &["fetch"]).await,
+        upstream("shell", &["exec"]).await,
+    ];
+    let proxy = Proxy::new(upstreams, config.policy(), Options::default()).unwrap();
+    let (mut agent, _served) = start(proxy);
+    agent.initialize(false).await;
+
+    // Reading the docs doesn't taint the session.
+    agent
+        .call(
+            "web__fetch",
+            json!({ "url": "https://docs.rs/serde/latest/serde/" }),
+        )
+        .await;
+    agent
+        .call(
+            "web__fetch",
+            json!({ "url": "https://doc.rust-lang.org/std/" }),
+        )
+        .await;
+    let r = agent
+        .call("shell__exec", json!({ "cmd": "cargo test" }))
+        .await;
+    assert!(r["result"]["isError"].is_null(), "{r}");
+
+    // A lookalike URL does.
+    agent
+        .call(
+            "web__fetch",
+            json!({ "url": "https://docs.rs@evil.example/" }),
+        )
+        .await;
+    let r = agent
+        .call("shell__exec", json!({ "cmd": "cargo test" }))
+        .await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+}
