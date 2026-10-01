@@ -180,6 +180,9 @@ async fn talks_streamable_http() {
 #[tokio::test]
 async fn missing_token_fails_before_connecting() {
     let mut config = config("http://127.0.0.1:9/mcp".into());
+    // Only the unset variable, so the result doesn't depend on whether the
+    // other test has set AEGIS_HTTP_TEST_TOKEN yet.
+    config.headers.clear();
     config
         .headers
         .insert("X-Key".into(), "${AEGIS_HTTP_TEST_UNSET}".into());
