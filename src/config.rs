@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::audit::ArgumentLogging;
-use crate::policy::{Action, Rule, Source};
+use crate::policy::{Action, Org, Rule, Source};
 use crate::resources::ResourceRule;
 
 /// Separator between a server name and its tool name in the tool names aegis
@@ -52,50 +52,30 @@ pub fn system_org_policy_path() -> PathBuf {
     }
 }
 
-/// An organization's policy: `[policy]`, `[[source]]` and `[[rule]]`, as in
-/// `aegis.toml`. A project's config is layered on top and can only make it
-/// stricter (see [`crate::policy::Policy::org`]).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// An organization's policy file: `[[source]]` and `[[rule]]` entries, as
+/// in `aegis.toml`, that apply on top of every project's (see
+/// [`crate::policy::Org`]).
+#[derive(Debug)]
 pub struct OrgPolicy {
-    #[serde(default)]
-    pub policy: PolicyConfig,
-    #[serde(default, rename = "source")]
-    pub sources: Vec<Source>,
-    #[serde(default, rename = "rule")]
-    pub rules: Vec<Rule>,
-    /// Where it was read from.
-    #[serde(skip)]
+    pub org: Org,
     pub path: PathBuf,
     /// SHA-256 of the file, recorded in the audit log at session start.
-    #[serde(skip)]
     pub sha256: String,
 }
 
 impl OrgPolicy {
     pub fn load(path: &Path) -> Result<Self> {
         use sha2::{Digest, Sha256};
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading organization policy {}", path.display()))?;
-        let text = std::str::from_utf8(&bytes)
-            .with_context(|| format!("organization policy {} is not UTF-8", path.display()))?;
-        let mut org: OrgPolicy = toml::from_str(text)
-            .with_context(|| format!("parsing organization policy {}", path.display()))?;
-        validate_conditions(&org.sources, &org.rules)
-            .with_context(|| format!("organization policy {}", path.display()))?;
-        org.path = path.to_path_buf();
-        org.sha256 = hex::encode(Sha256::digest(&bytes));
-        Ok(org)
-    }
-
-    pub fn policy(&self) -> crate::policy::Policy {
-        crate::policy::Policy {
-            sources: self.sources.clone(),
-            rules: self.rules.clone(),
-            default: self.policy.default,
-            default_labels: self.policy.default_labels.clone(),
-            org: None,
-        }
+        let context = || format!("organization policy {}", path.display());
+        let bytes = std::fs::read(path).with_context(context)?;
+        let org: Org = toml::from_str(std::str::from_utf8(&bytes).with_context(context)?)
+            .with_context(context)?;
+        validate_conditions(&org.sources, &org.rules).with_context(context)?;
+        Ok(Self {
+            org,
+            path: path.to_path_buf(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        })
     }
 }
 
@@ -392,7 +372,7 @@ impl Config {
             rules: self.rules.clone(),
             default: self.policy.default,
             default_labels: self.policy.default_labels.clone(),
-            org: self.org.as_ref().map(|o| Box::new(o.policy())),
+            org: self.org.as_ref().map(|o| o.org.clone()),
         }
     }
 }
@@ -539,17 +519,18 @@ mod tests {
     fn org_policy_files_hold_only_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("org.toml");
-        std::fs::write(
-            &path,
-            "[policy]\ndefault_labels = []\n[[rule]]\ntool = \"*__delete_*\"\naction = \"deny\"",
-        )
-        .unwrap();
+        std::fs::write(&path, "[[rule]]\ntool = \"*__delete_*\"\naction = \"deny\"").unwrap();
         let org = OrgPolicy::load(&path).unwrap();
-        assert_eq!(org.rules.len(), 1);
+        assert_eq!(org.org.rules.len(), 1);
         assert_eq!(org.sha256.len(), 64);
 
-        std::fs::write(&path, "[[server]]\nname = \"x\"\ncommand = \"x\"").unwrap();
-        assert!(OrgPolicy::load(&path).is_err());
+        for not_org in [
+            "[[server]]\nname = \"x\"\ncommand = \"x\"",
+            "[policy]\ndefault = \"deny\"",
+        ] {
+            std::fs::write(&path, not_org).unwrap();
+            assert!(OrgPolicy::load(&path).is_err(), "{not_org}");
+        }
         std::fs::write(&path, "not toml [").unwrap();
         assert!(OrgPolicy::load(&path).is_err());
     }

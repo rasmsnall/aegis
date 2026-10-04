@@ -64,23 +64,10 @@ impl Watcher {
         let time = format_time(entry.ts);
         let time = style.paint("2", time.get(11..).unwrap_or(&time));
         match &entry.event {
-            Event::SessionStart {
-                servers,
-                org_policy,
-            } => out.push(format!(
+            Event::SessionStart { servers, .. } => out.push(format!(
                 "{time}  {} {}",
                 style.paint("1", "── session started"),
-                style.paint(
-                    "2",
-                    &format!(
-                        "({}){}",
-                        servers.join(", "),
-                        org_policy
-                            .as_deref()
-                            .map(|h| format!(" under org policy {}", h.get(..12).unwrap_or(h)))
-                            .unwrap_or_default()
-                    )
-                )
+                style.paint("2", &format!("({})", servers.join(", ")))
             )),
             Event::SessionEnd => {
                 out.push(format!("{time}  {}", style.paint("1", "── session ended")))

@@ -28,9 +28,7 @@ enum Command {
     Run {
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
-        /// Organization policy to layer the config on. An organization policy
-        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
-        /// Windows) always applies and can't be replaced with this.
+        /// Organization policy to use if none is installed at /etc/aegis/org.toml.
         #[arg(long)]
         org_policy: Option<PathBuf>,
     },
@@ -38,9 +36,7 @@ enum Command {
     Check {
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
-        /// Organization policy to layer the config on. An organization policy
-        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
-        /// Windows) always applies and can't be replaced with this.
+        /// Organization policy to use if none is installed at /etc/aegis/org.toml.
         #[arg(long)]
         org_policy: Option<PathBuf>,
     },
@@ -53,11 +49,6 @@ enum Command {
         /// Exit with status 1 if there are any warnings.
         #[arg(long)]
         strict: bool,
-        /// Organization policy to layer the config on. An organization policy
-        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
-        /// Windows) always applies and can't be replaced with this.
-        #[arg(long)]
-        org_policy: Option<PathBuf>,
     },
     /// Verify an audit log's chain (and signatures, given the key).
     Verify {
@@ -117,9 +108,7 @@ enum Command {
         /// Print a Markdown table (for pull request comments) instead.
         #[arg(long)]
         markdown: bool,
-        /// Organization policy to layer the config on. An organization policy
-        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
-        /// Windows) always applies and can't be replaced with this.
+        /// Organization policy to use if none is installed at /etc/aegis/org.toml.
         #[arg(long)]
         org_policy: Option<PathBuf>,
     },
@@ -176,23 +165,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!(
                     "under organization policy {} ({} sources, {} rules, sha256 {})",
                     org.path.display(),
-                    org.sources.len(),
-                    org.rules.len(),
+                    org.org.sources.len(),
+                    org.org.rules.len(),
                     org.sha256
                 );
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Tools {
-            config,
-            strict,
-            org_policy,
-        } => {
-            tools(
-                &Config::load_with_org(&config, org_policy.as_deref())?,
-                strict,
-            )
-            .await
+        Command::Tools { config, strict } => {
+            tools(&Config::load_with_org(&config, None)?, strict).await
         }
         Command::Verify { log, key_file } => {
             let key = AuditKey::load(key_file.as_deref())?;
@@ -387,18 +368,6 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
 /// that names it (or the default), plus any argument-dependent sources
 /// checked before it, e.g. `untrusted; trusted if url host docs.rs`.
 fn describe_labels(policy: &Policy, tool: &str) -> String {
-    match &policy.org {
-        // The output gets both sets of labels.
-        Some(org) => format!(
-            "org: {}; project: {}",
-            describe_own_labels(org, tool),
-            describe_own_labels(policy, tool)
-        ),
-        None => describe_own_labels(policy, tool),
-    }
-}
-
-fn describe_own_labels(policy: &Policy, tool: &str) -> String {
     let names = |labels: &[String]| {
         if labels.is_empty() {
             "trusted".to_string()
@@ -426,39 +395,38 @@ fn describe_own_labels(policy: &Policy, tool: &str) -> String {
         .join("; ")
 }
 
-/// The rules that may decide calls to `tool`: the org's (`org #1 deny`)
-/// then the project's.
+/// The rules that may decide calls to `tool`, the org's first: `org #1 deny,
+/// #2 allow if untrusted`.
 fn describe_rules(policy: &Policy, tool: &str) -> String {
-    let own = describe_own_rules(policy, tool, "");
-    match &policy.org {
-        Some(org) => format!("{}, {own}", describe_own_rules(org, tool, "org ")),
-        None => own,
-    }
-}
-
-fn describe_own_rules(policy: &Policy, tool: &str, prefix: &str) -> String {
-    let rules = policy.rules_for(tool);
-    if rules.is_empty() {
-        let default = policy.default.as_str();
-        return format!("- ({prefix}default: {default})");
-    }
-    rules
-        .iter()
-        .map(|&r| {
-            let rule = &policy.rules[r - 1];
+    let org = policy.org.iter().flat_map(|o| o.rules.iter().enumerate());
+    let rules: Vec<String> = org
+        .map(|(i, rule)| ("org #", i, rule))
+        .chain(
+            policy
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(i, rule)| ("#", i, rule)),
+        )
+        .filter(|(_, _, rule)| glob_match(&rule.tool, tool))
+        .map(|(prefix, i, rule)| {
             let action = rule.action.as_str();
             let mut conditions = rule.conditions().describe();
             if !rule.when_context_has.is_empty() {
                 conditions.insert(0, rule.when_context_has.join("|"));
             }
             if conditions.is_empty() {
-                format!("{prefix}#{r} {action}")
+                format!("{prefix}{} {action}", i + 1)
             } else {
-                format!("{prefix}#{r} {action} if {}", conditions.join(" and "))
+                format!("{prefix}{} {action} if {}", i + 1, conditions.join(" and "))
             }
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    if rules.is_empty() {
+        let default = policy.default.as_str();
+        return format!("- (default: {default})");
+    }
+    rules.join(", ")
 }
 
 /// A replay report as a Markdown section, for pull request comments.

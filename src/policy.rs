@@ -28,11 +28,11 @@
 //! a broader `deny`: a `deny` limited to some hosts is a denylist, and any
 //! host it doesn't name gets through.
 //!
-//! A policy can sit on top of an organization's policy (`org`). The two are
-//! evaluated separately and combined so the result is never looser than the
-//! org's alone: a call gets the stricter of the two decisions (deny, then
-//! ask, then allow), and output gets the labels of both. A project policy
-//! can add rules and labels but cannot remove any the org policy sets.
+//! An organization can add sources and rules of its own (`org`) that every
+//! project's policy runs under. Output gets the labels of the first matching
+//! org source as well, and a call gets the stricter of the first matching
+//! org rule's decision and the project's (deny, then ask, then allow), so a
+//! project can tighten the org's policy but never loosen it.
 
 use std::collections::BTreeMap;
 
@@ -272,10 +272,20 @@ pub struct Policy {
     pub default: Action,
     /// Labels for the output of tools that no source matches.
     pub default_labels: Vec<String>,
-    /// The organization's policy this one is layered on. It always applies;
-    /// this policy can only make decisions stricter and add labels.
+    /// The organization's sources and rules, applied on top of these.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org: Option<Box<Policy>>,
+    pub org: Option<Org>,
+}
+
+/// An organization's sources and rules. They only add: labels on output,
+/// and stricter decisions. Where none matches, the org has no say.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Org {
+    #[serde(default, rename = "source")]
+    pub sources: Vec<Source>,
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<Rule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,22 +314,20 @@ impl Decision {
         }
     }
 
-    /// The deciding rule in words: `rule #2`, `org rule #1`, `default` or
-    /// `org default`.
+    /// The deciding rule in words: `rule #2`, `org rule #1` or `default`.
     pub fn rule_label(&self) -> String {
-        let org = if self.org { "org " } else { "" };
-        match self.rule {
-            Some(r) => format!("{org}rule #{r}"),
-            None => format!("{org}default"),
+        match (self.rule, self.org) {
+            (Some(r), true) => format!("org rule #{r}"),
+            (Some(r), false) => format!("rule #{r}"),
+            (None, _) => "default".to_string(),
         }
     }
 
     /// The tool error shown to the agent when the call does not run.
     pub fn message(&self, tool: &str) -> String {
-        let rule = match (self.rule, self.org) {
-            (Some(_), _) => self.rule_label(),
-            (None, false) => "the default policy".to_string(),
-            (None, true) => "the organization's default policy".to_string(),
+        let rule = match self.rule {
+            Some(_) => self.rule_label(),
+            None => "the default policy".to_string(),
         };
         let because = if self.matched_labels.is_empty() {
             String::new()
@@ -344,33 +352,23 @@ impl Decision {
 
 impl Policy {
     /// Labels carried by the output of a call to `tool` with `arguments`:
-    /// those of the first matching source, else `default_labels`. Under an
-    /// org policy, the org's labels plus this policy's; this policy's
-    /// `default_labels` then only apply when neither has a matching source.
+    /// those of the first matching source, else `default_labels`, plus those
+    /// of the first matching org source.
     pub fn labels_for_result(&self, tool: &str, arguments: &Value) -> LabelSet {
-        let own = self.sources.iter().find(|s| s.matches(tool, arguments));
-        let Some(org) = &self.org else {
-            return match own {
-                Some(source) => source.labels.iter().cloned().collect(),
-                None => self.default_labels.iter().cloned().collect(),
-            };
+        let mut labels: LabelSet = match self.sources.iter().find(|s| s.matches(tool, arguments)) {
+            Some(source) => source.labels.iter().cloned().collect(),
+            None => self.default_labels.iter().cloned().collect(),
         };
-        let mut labels = org.labels_for_result(tool, arguments);
-        match own {
-            Some(source) => labels.extend(source.labels.iter().cloned()),
-            None if !org.sources.iter().any(|s| s.matches(tool, arguments)) => {
-                labels.extend(self.default_labels.iter().cloned())
-            }
-            None => {}
+        let org = self.org.iter().flat_map(|o| &o.sources);
+        if let Some(source) = org.into_iter().find(|s| s.matches(tool, arguments)) {
+            labels.extend(source.labels.iter().cloned());
         }
         labels
     }
 
-    /// Whether any source, this policy's or the org's, names `tool`
-    /// explicitly (whatever its conditions).
+    /// Whether any source names `tool` explicitly (whatever its conditions).
     pub fn has_source_for(&self, tool: &str) -> bool {
         self.sources.iter().any(|s| glob_match(&s.tool, tool))
-            || self.org.as_ref().is_some_and(|o| o.has_source_for(tool))
     }
 
     /// 1-based indexes of the rules whose tool pattern matches `tool`,
@@ -383,54 +381,60 @@ impl Policy {
     }
 
     /// The first rule matching a call of `tool` with `arguments`, given the
-    /// session's `context`, decides it; else the policy's default. Under an
-    /// org policy, the stricter of its decision and this one's; on a tie the
-    /// org's deny or ask is reported, and this policy's allow.
+    /// session's `context`, decides it; else the policy's default. If an org
+    /// rule matches too, the stricter decision wins (the org's on a tie).
     pub fn decide(&self, tool: &str, arguments: &Value, context: &LabelSet) -> Decision {
-        let own = self.decide_own(tool, arguments, context);
-        let Some(org) = &self.org else {
-            return own;
-        };
-        let org = Decision {
-            org: true,
-            ..org.decide_own(tool, arguments, context)
-        };
-        let (o, p) = (org.action.strictness(), own.action.strictness());
-        if o > p || (o == p && o > 0) { org } else { own }
-    }
-
-    fn decide_own(&self, tool: &str, arguments: &Value, context: &LabelSet) -> Decision {
-        for (i, rule) in self.rules.iter().enumerate() {
-            if !glob_match(&rule.tool, tool) || !rule.conditions().hold(arguments) {
-                continue;
-            }
-            let matched_labels: Vec<String> = rule
-                .when_context_has
-                .iter()
-                .filter(|l| context.contains(*l))
-                .cloned()
-                .collect();
-            if !rule.when_context_has.is_empty() && matched_labels.is_empty() {
-                continue;
-            }
-            return Decision {
-                action: rule.action,
-                rule: Some(i + 1),
-                matched_labels,
-                reason: rule.reason.clone(),
-                approved: None,
-                org: false,
-            };
-        }
-        Decision {
+        let own = first_match(&self.rules, tool, arguments, context).unwrap_or(Decision {
             action: self.default,
             rule: None,
             matched_labels: Vec::new(),
             reason: None,
             approved: None,
             org: false,
+        });
+        let org = self
+            .org
+            .as_ref()
+            .and_then(|o| first_match(&o.rules, tool, arguments, context));
+        match org {
+            Some(org) if org.action.strictness() >= own.action.strictness() => {
+                Decision { org: true, ..org }
+            }
+            _ => own,
         }
     }
+}
+
+/// The decision of the first of `rules` that matches the call, if any.
+fn first_match(
+    rules: &[Rule],
+    tool: &str,
+    arguments: &Value,
+    context: &LabelSet,
+) -> Option<Decision> {
+    for (i, rule) in rules.iter().enumerate() {
+        if !glob_match(&rule.tool, tool) || !rule.conditions().hold(arguments) {
+            continue;
+        }
+        let matched_labels: Vec<String> = rule
+            .when_context_has
+            .iter()
+            .filter(|l| context.contains(*l))
+            .cloned()
+            .collect();
+        if !rule.when_context_has.is_empty() && matched_labels.is_empty() {
+            continue;
+        }
+        return Some(Decision {
+            action: rule.action,
+            rule: Some(i + 1),
+            matched_labels,
+            reason: rule.reason.clone(),
+            approved: None,
+            org: false,
+        });
+    }
+    None
 }
 
 /// Taint state for one agent session.
@@ -767,11 +771,9 @@ mod tests {
         assert_eq!(policy.rules_for("web__fetch"), vec![1, 2]);
     }
 
-    fn org_policy() -> Policy {
-        let mut docs = Source::new("web__fetch", &[]);
-        docs.hosts = vec!["docs.rs".into()];
-        Policy {
-            sources: vec![docs, Source::new("web__*", &["untrusted"])],
+    fn org() -> Org {
+        Org {
+            sources: vec![Source::new("web__*", &["untrusted"])],
             rules: vec![
                 Rule {
                     when_context_has: vec!["untrusted".into()],
@@ -781,9 +783,6 @@ mod tests {
                 Rule::new("*__delete_*", Action::Deny),
                 Rule::new("github__push_files", Action::Ask),
             ],
-            default: Action::Allow,
-            default_labels: vec![],
-            org: None,
         }
     }
 
@@ -805,7 +804,7 @@ mod tests {
             ],
             default: Action::Allow,
             default_labels: vec![],
-            org: Some(Box::new(org_policy())),
+            org: Some(org()),
         };
         let mut session = Session::default();
         let check = |s: &Session, tool: &str| s.check_call(&project, tool, &json!({}));
@@ -833,29 +832,20 @@ mod tests {
         assert_eq!((d.action, d.rule, d.org), (Action::Allow, Some(1), false));
     }
 
-    #[test]
-    fn project_default_labels_cover_only_tools_neither_policy_lists() {
-        use serde_json::json;
-        let project = Policy {
-            sources: vec![],
-            rules: vec![],
-            default: Action::Allow,
-            default_labels: vec!["untrusted".into()],
-            org: Some(Box::new(org_policy())),
-        };
-        let labels = |tool: &str, args| project.labels_for_result(tool, &args);
-        assert!(labels("web__fetch", json!({ "url": "https://docs.rs/x" })).is_empty());
-        assert!(labels("mail__read", json!({})).contains("untrusted"));
-        assert!(project.has_source_for("web__fetch"));
-    }
-
     /// Whatever a project policy says, no call is decided more loosely than
     /// the org policy alone would decide it, and no output carries fewer
     /// labels.
     #[test]
     fn a_project_policy_never_loosens_the_org_policy() {
         use serde_json::json;
-        let org = org_policy();
+        // The org's sources and rules under a project that adds nothing.
+        let alone = Policy {
+            sources: vec![],
+            rules: vec![],
+            default: Action::Allow,
+            default_labels: vec![],
+            org: Some(org()),
+        };
         let tools = [
             "shell__exec",
             "web__fetch",
@@ -884,18 +874,18 @@ mod tests {
                             rules: vec![Rule::new(tool_pattern, action)],
                             default,
                             default_labels: vec![],
-                            org: Some(Box::new(org.clone())),
+                            org: Some(org()),
                         };
                         for tool in tools {
                             for a in &args {
                                 let layered = project.labels_for_result(tool, a);
-                                assert!(layered.is_superset(&org.labels_for_result(tool, a)));
+                                assert!(layered.is_superset(&alone.labels_for_result(tool, a)));
                                 for context in &contexts {
                                     let layered = project.decide(tool, a, context).action;
-                                    let alone = org.decide(tool, a, context).action;
+                                    let floor = alone.decide(tool, a, context).action;
                                     assert!(
-                                        layered.strictness() >= alone.strictness(),
-                                        "{tool} {a} {context:?}: {layered:?} < {alone:?}"
+                                        layered.strictness() >= floor.strictness(),
+                                        "{tool} {a} {context:?}: {layered:?} < {floor:?}"
                                     );
                                 }
                             }

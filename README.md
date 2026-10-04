@@ -182,15 +182,11 @@ doesn't name gets through.
 
 ### Organization policies
 
-An organization can set a policy that every project's `aegis.toml` runs
-under. It holds the same `[policy]`, `[[source]]` and `[[rule]]` sections
-(and nothing else):
+An organization can add `[[source]]` and `[[rule]]` entries that apply on top
+of every project's `aegis.toml`, in a file at `/etc/aegis/org.toml`
+(`%ProgramData%\aegis\org.toml` on Windows):
 
 ```toml
-# /etc/aegis/org.toml
-[policy]
-default_labels = []        # leave labelling of tools it doesn't list to projects
-
 [[source]]
 tool = "*__get_issue*"
 labels = ["untrusted"]
@@ -200,34 +196,23 @@ tool = "shell__*"
 when_context_has = ["untrusted"]
 action = "deny"
 reason = "company policy: no shell commands after reading untrusted input"
-
-[[rule]]
-tool = "*__delete_*"
-action = "deny"
 ```
 
-The two policies are evaluated separately and combined so the result is
-never looser than the org's alone:
+The org's entries only add, so a project can tighten them but never loosen
+them:
 
-- A call gets the stricter of the two decisions: `deny`, then `ask`, then
-  `allow`. A project can't allow what the org denies or asks about, but it
-  can deny or ask about more.
-- Output gets the labels of both. A project's `default_labels` cover only
-  tools neither policy lists; the org's `default_labels` always apply to
-  tools it doesn't list, so an org policy that should only add rules sets
-  `default_labels = []`.
+- Output gets the labels of the first matching org source on top of the
+  project's.
+- If an org rule matches a call, the stricter of its decision and the
+  project's wins (`deny`, then `ask`, then `allow`).
+- Where no org entry matches, the project decides alone.
 
-aegis loads the org policy from `/etc/aegis/org.toml` (on Windows,
-`%ProgramData%\aegis\org.toml`) whenever that file exists, and refuses to
-start if it can't be read or parsed. `--org-policy <file>` (on `run`,
-`check`, `tools` and `replay`) uses another file when none is installed, for
-CI and testing; it can't replace an installed one. `aegis check` shows which
-org policy applies, the SHA-256 of the file is recorded at the start of
-every session in the audit log, and blocked calls name `org rule #N`.
-
-Installing the file is only as strong as the machine's permissions: put it
-where only administrators can write, for example with your device
-management. A developer with administrator rights can remove it.
+If the file exists but can't be read or parsed, aegis doesn't start.
+`--org-policy <file>` (on `run`, `check` and `replay`) uses another file when
+none is installed, for CI and testing; it can't replace an installed one.
+Blocked calls name `org rule #N`, and the file's SHA-256 is recorded at the
+start of every session in the audit log. The file is only as safe as its
+permissions: put it where only administrators can write.
 
 ### Remote servers
 

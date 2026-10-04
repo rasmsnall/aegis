@@ -189,16 +189,7 @@ fn render_session(h: &mut String, number: usize, session: &Session) {
         .map(|s| format_time(s.ts))
         .unwrap_or_else(|| "unknown".into());
     let servers = match session.start.map(|s| &s.event) {
-        Some(Event::SessionStart {
-            servers,
-            org_policy,
-        }) => {
-            servers.join(", ")
-                + &org_policy
-                    .as_deref()
-                    .map(|h| format!("; org policy {}", h.get(..12).unwrap_or(h)))
-                    .unwrap_or_default()
-        }
+        Some(Event::SessionStart { servers, .. }) => servers.join(", "),
         _ => String::new(),
     };
     let _ = write!(
@@ -250,7 +241,6 @@ fn render_session(h: &mut String, number: usize, session: &Session) {
                 let (word, class) = verdict(decision);
                 let rule = match decision.rule {
                     Some(_) => decision.rule_label(),
-                    None if decision.org => "org default policy".to_string(),
                     None => "default policy".to_string(),
                 };
                 let why = match &decision.reason {

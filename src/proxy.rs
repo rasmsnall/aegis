@@ -549,13 +549,10 @@ impl Proxy {
             shown.truncate(cut);
             shown += "…";
         }
-        let (rule, default) = if decision.org {
-            (
-                "The organization's rule",
-                "The organization's default policy",
-            )
+        let rule = if decision.org {
+            "The organization's rule"
         } else {
-            ("Rule", "The default policy")
+            "Rule"
         };
         let why = match (&decision.rule, decision.matched_labels.is_empty()) {
             (Some(r), false) => format!(
@@ -563,7 +560,7 @@ impl Proxy {
                 decision.matched_labels.join(", ")
             ),
             (Some(r), true) => format!("{rule} #{r} asks for approval."),
-            (None, _) => format!("{default} asks for approval."),
+            (None, _) => "The default policy asks for approval.".to_string(),
         };
         let message = format!(
             "aegis: the agent wants to call {tool} with {shown}\n\n{why}{}\n\nAllow this one call?",
