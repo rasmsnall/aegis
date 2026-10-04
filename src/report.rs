@@ -189,7 +189,16 @@ fn render_session(h: &mut String, number: usize, session: &Session) {
         .map(|s| format_time(s.ts))
         .unwrap_or_else(|| "unknown".into());
     let servers = match session.start.map(|s| &s.event) {
-        Some(Event::SessionStart { servers }) => servers.join(", "),
+        Some(Event::SessionStart {
+            servers,
+            org_policy,
+        }) => {
+            servers.join(", ")
+                + &org_policy
+                    .as_deref()
+                    .map(|h| format!("; org policy {}", h.get(..12).unwrap_or(h)))
+                    .unwrap_or_default()
+        }
         _ => String::new(),
     };
     let _ = write!(
@@ -239,9 +248,11 @@ fn render_session(h: &mut String, number: usize, session: &Session) {
                 decision,
             } => {
                 let (word, class) = verdict(decision);
-                let rule = decision
-                    .rule
-                    .map_or("default policy".to_string(), |r| format!("rule #{r}"));
+                let rule = match decision.rule {
+                    Some(_) => decision.rule_label(),
+                    None if decision.org => "org default policy".to_string(),
+                    None => "default policy".to_string(),
+                };
                 let why = match &decision.reason {
                     Some(r) if !decision.runs() => {
                         format!("<div class=\"dim small\">{}</div>", escape(r))
@@ -336,6 +347,7 @@ mod tests {
             matched_labels: vec!["untrusted".into()],
             reason: Some("no shell after the web".into()),
             approved,
+            org: false,
         }
     }
 
@@ -353,6 +365,7 @@ mod tests {
         let mut log = AuditLog::open(&path, None).unwrap();
         log.record(Event::SessionStart {
             servers: vec!["web".into(), "shell".into()],
+            org_policy: None,
         })
         .unwrap();
         log.record(Event::ToolCall {
@@ -365,6 +378,7 @@ mod tests {
                 matched_labels: vec![],
                 reason: None,
                 approved: None,
+                org: false,
             },
         })
         .unwrap();

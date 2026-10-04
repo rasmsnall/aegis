@@ -27,6 +27,12 @@
 //! the next rule decides, so conditions belong on `allow` rules followed by
 //! a broader `deny`: a `deny` limited to some hosts is a denylist, and any
 //! host it doesn't name gets through.
+//!
+//! A policy can sit on top of an organization's policy (`org`). The two are
+//! evaluated separately and combined so the result is never looser than the
+//! org's alone: a call gets the stricter of the two decisions (deny, then
+//! ask, then allow), and output gets the labels of both. A project policy
+//! can add rules and labels but cannot remove any the org policy sets.
 
 use std::collections::BTreeMap;
 
@@ -45,6 +51,15 @@ pub enum Action {
 }
 
 impl Action {
+    /// Deny is stricter than ask, which is stricter than allow.
+    fn strictness(self) -> u8 {
+        match self {
+            Action::Allow => 0,
+            Action::Ask => 1,
+            Action::Deny => 2,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Action::Allow => "allow",
@@ -257,6 +272,10 @@ pub struct Policy {
     pub default: Action,
     /// Labels for the output of tools that no source matches.
     pub default_labels: Vec<String>,
+    /// The organization's policy this one is layered on. It always applies;
+    /// this policy can only make decisions stricter and add labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<Box<Policy>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +289,9 @@ pub struct Decision {
     /// For `ask`: whether a person approved the call. `None` until answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved: Option<bool>,
+    /// Whether the org policy decided (so `rule` numbers an org rule).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub org: bool,
 }
 
 impl Decision {
@@ -282,11 +304,23 @@ impl Decision {
         }
     }
 
+    /// The deciding rule in words: `rule #2`, `org rule #1`, `default` or
+    /// `org default`.
+    pub fn rule_label(&self) -> String {
+        let org = if self.org { "org " } else { "" };
+        match self.rule {
+            Some(r) => format!("{org}rule #{r}"),
+            None => format!("{org}default"),
+        }
+    }
+
     /// The tool error shown to the agent when the call does not run.
     pub fn message(&self, tool: &str) -> String {
-        let rule = self
-            .rule
-            .map_or("the default policy".to_string(), |r| format!("rule #{r}"));
+        let rule = match (self.rule, self.org) {
+            (Some(_), _) => self.rule_label(),
+            (None, false) => "the default policy".to_string(),
+            (None, true) => "the organization's default policy".to_string(),
+        };
         let because = if self.matched_labels.is_empty() {
             String::new()
         } else {
@@ -310,17 +344,33 @@ impl Decision {
 
 impl Policy {
     /// Labels carried by the output of a call to `tool` with `arguments`:
-    /// those of the first matching source, else `default_labels`.
+    /// those of the first matching source, else `default_labels`. Under an
+    /// org policy, the org's labels plus this policy's; this policy's
+    /// `default_labels` then only apply when neither has a matching source.
     pub fn labels_for_result(&self, tool: &str, arguments: &Value) -> LabelSet {
-        match self.sources.iter().find(|s| s.matches(tool, arguments)) {
-            Some(source) => source.labels.iter().cloned().collect(),
-            None => self.default_labels.iter().cloned().collect(),
+        let own = self.sources.iter().find(|s| s.matches(tool, arguments));
+        let Some(org) = &self.org else {
+            return match own {
+                Some(source) => source.labels.iter().cloned().collect(),
+                None => self.default_labels.iter().cloned().collect(),
+            };
+        };
+        let mut labels = org.labels_for_result(tool, arguments);
+        match own {
+            Some(source) => labels.extend(source.labels.iter().cloned()),
+            None if !org.sources.iter().any(|s| s.matches(tool, arguments)) => {
+                labels.extend(self.default_labels.iter().cloned())
+            }
+            None => {}
         }
+        labels
     }
 
-    /// Whether any source names `tool` explicitly (whatever its conditions).
+    /// Whether any source, this policy's or the org's, names `tool`
+    /// explicitly (whatever its conditions).
     pub fn has_source_for(&self, tool: &str) -> bool {
         self.sources.iter().any(|s| glob_match(&s.tool, tool))
+            || self.org.as_ref().is_some_and(|o| o.has_source_for(tool))
     }
 
     /// 1-based indexes of the rules whose tool pattern matches `tool`,
@@ -333,8 +383,23 @@ impl Policy {
     }
 
     /// The first rule matching a call of `tool` with `arguments`, given the
-    /// session's `context`, decides it; else the policy's default.
+    /// session's `context`, decides it; else the policy's default. Under an
+    /// org policy, the stricter of its decision and this one's; on a tie the
+    /// org's deny or ask is reported, and this policy's allow.
     pub fn decide(&self, tool: &str, arguments: &Value, context: &LabelSet) -> Decision {
+        let own = self.decide_own(tool, arguments, context);
+        let Some(org) = &self.org else {
+            return own;
+        };
+        let org = Decision {
+            org: true,
+            ..org.decide_own(tool, arguments, context)
+        };
+        let (o, p) = (org.action.strictness(), own.action.strictness());
+        if o > p || (o == p && o > 0) { org } else { own }
+    }
+
+    fn decide_own(&self, tool: &str, arguments: &Value, context: &LabelSet) -> Decision {
         for (i, rule) in self.rules.iter().enumerate() {
             if !glob_match(&rule.tool, tool) || !rule.conditions().hold(arguments) {
                 continue;
@@ -354,6 +419,7 @@ impl Policy {
                 matched_labels,
                 reason: rule.reason.clone(),
                 approved: None,
+                org: false,
             };
         }
         Decision {
@@ -362,6 +428,7 @@ impl Policy {
             matched_labels: Vec::new(),
             reason: None,
             approved: None,
+            org: false,
         }
     }
 }
@@ -488,6 +555,7 @@ mod tests {
             ],
             default: Action::Allow,
             default_labels: vec!["untrusted".into()],
+            org: None,
         }
     }
 
@@ -606,6 +674,7 @@ mod tests {
             rules: vec![],
             default: Action::Allow,
             default_labels: vec!["untrusted".into()],
+            org: None,
         };
         let labels = |tool: &str, args: serde_json::Value| policy.labels_for_result(tool, &args);
 
@@ -663,6 +732,7 @@ mod tests {
             ],
             default: Action::Allow,
             default_labels: vec![],
+            org: None,
         };
         let mut session = Session::default();
         let fetch = |session: &Session, url: &str| {
@@ -695,6 +765,145 @@ mod tests {
         assert_eq!(push("rasmsnall"), Action::Allow);
         assert_eq!(push("someone"), Action::Ask);
         assert_eq!(policy.rules_for("web__fetch"), vec![1, 2]);
+    }
+
+    fn org_policy() -> Policy {
+        let mut docs = Source::new("web__fetch", &[]);
+        docs.hosts = vec!["docs.rs".into()];
+        Policy {
+            sources: vec![docs, Source::new("web__*", &["untrusted"])],
+            rules: vec![
+                Rule {
+                    when_context_has: vec!["untrusted".into()],
+                    reason: Some("org: no shell after the web".into()),
+                    ..Rule::new("shell__*", Action::Deny)
+                },
+                Rule::new("*__delete_*", Action::Deny),
+                Rule::new("github__push_files", Action::Ask),
+            ],
+            default: Action::Allow,
+            default_labels: vec![],
+            org: None,
+        }
+    }
+
+    #[test]
+    fn org_rules_win_over_looser_project_rules() {
+        use serde_json::json;
+        let project = Policy {
+            sources: vec![
+                Source::new("web__*", &[]),
+                Source::new("mail__*", &["mail"]),
+            ],
+            rules: vec![
+                Rule::new("shell__*", Action::Allow),
+                Rule::new("github__delete_file", Action::Allow),
+                Rule {
+                    when_context_has: vec!["mail".into()],
+                    ..Rule::new("files__write", Action::Deny)
+                },
+            ],
+            default: Action::Allow,
+            default_labels: vec![],
+            org: Some(Box::new(org_policy())),
+        };
+        let mut session = Session::default();
+        let check = |s: &Session, tool: &str| s.check_call(&project, tool, &json!({}));
+
+        // The project trusts the web; the org doesn't, so pages still taint.
+        let page = json!({ "url": "https://evil.example/" });
+        session.observe_result(&project, "web__fetch", &page);
+        assert!(session.context().contains("untrusted"));
+        let d = check(&session, "shell__exec");
+        assert_eq!((d.action, d.rule, d.org), (Action::Deny, Some(1), true));
+        assert_eq!(
+            d.message("shell__exec"),
+            "aegis blocked this call to shell__exec (org rule #1) because this session has read data labelled untrusted: org: no shell after the web"
+        );
+        assert_eq!(check(&session, "github__delete_file").action, Action::Deny);
+        assert_eq!(check(&session, "github__push_files").action, Action::Ask);
+
+        // The project can add labels and rules of its own.
+        session.observe_result(&project, "mail__read", &json!({}));
+        assert!(session.context().contains("mail"));
+        let d = check(&session, "files__write");
+        assert_eq!((d.action, d.rule, d.org), (Action::Deny, Some(3), false));
+        // Allowed by both: the project's rule is reported.
+        let d = check(&Session::default(), "shell__exec");
+        assert_eq!((d.action, d.rule, d.org), (Action::Allow, Some(1), false));
+    }
+
+    #[test]
+    fn project_default_labels_cover_only_tools_neither_policy_lists() {
+        use serde_json::json;
+        let project = Policy {
+            sources: vec![],
+            rules: vec![],
+            default: Action::Allow,
+            default_labels: vec!["untrusted".into()],
+            org: Some(Box::new(org_policy())),
+        };
+        let labels = |tool: &str, args| project.labels_for_result(tool, &args);
+        assert!(labels("web__fetch", json!({ "url": "https://docs.rs/x" })).is_empty());
+        assert!(labels("mail__read", json!({})).contains("untrusted"));
+        assert!(project.has_source_for("web__fetch"));
+    }
+
+    /// Whatever a project policy says, no call is decided more loosely than
+    /// the org policy alone would decide it, and no output carries fewer
+    /// labels.
+    #[test]
+    fn a_project_policy_never_loosens_the_org_policy() {
+        use serde_json::json;
+        let org = org_policy();
+        let tools = [
+            "shell__exec",
+            "web__fetch",
+            "github__delete_file",
+            "github__push_files",
+            "files__read",
+        ];
+        let args = [
+            json!({}),
+            json!({ "url": "https://docs.rs/x" }),
+            json!({ "url": "https://evil.example/" }),
+        ];
+        let actions = [Action::Allow, Action::Ask, Action::Deny];
+        let labelings: [&[&str]; 3] = [&[], &["untrusted"], &["other"]];
+        let contexts: Vec<LabelSet> = vec![
+            LabelSet::new(),
+            ["untrusted".to_string()].into(),
+            ["other".to_string()].into(),
+        ];
+        for &tool_pattern in &["*", "shell__*", "web__fetch", "github__*"] {
+            for &action in &actions {
+                for labels in labelings {
+                    for &default in &actions {
+                        let project = Policy {
+                            sources: vec![Source::new(tool_pattern, labels)],
+                            rules: vec![Rule::new(tool_pattern, action)],
+                            default,
+                            default_labels: vec![],
+                            org: Some(Box::new(org.clone())),
+                        };
+                        for tool in tools {
+                            for a in &args {
+                                let layered = project.labels_for_result(tool, a);
+                                assert!(layered.is_superset(&org.labels_for_result(tool, a)));
+                                for context in &contexts {
+                                    let layered = project.decide(tool, a, context).action;
+                                    let alone = org.decide(tool, a, context).action;
+                                    assert!(
+                                        layered.strictness() >= alone.strictness(),
+                                        "{tool} {a} {context:?}: {layered:?} < {alone:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -64,10 +64,23 @@ impl Watcher {
         let time = format_time(entry.ts);
         let time = style.paint("2", time.get(11..).unwrap_or(&time));
         match &entry.event {
-            Event::SessionStart { servers } => out.push(format!(
+            Event::SessionStart {
+                servers,
+                org_policy,
+            } => out.push(format!(
                 "{time}  {} {}",
                 style.paint("1", "── session started"),
-                style.paint("2", &format!("({})", servers.join(", ")))
+                style.paint(
+                    "2",
+                    &format!(
+                        "({}){}",
+                        servers.join(", "),
+                        org_policy
+                            .as_deref()
+                            .map(|h| format!(" under org policy {}", h.get(..12).unwrap_or(h)))
+                            .unwrap_or_default()
+                    )
+                )
             )),
             Event::SessionEnd => {
                 out.push(format!("{time}  {}", style.paint("1", "── session ended")))
@@ -87,9 +100,7 @@ impl Watcher {
                     style.paint("1", tool)
                 );
                 if kind != "ok" {
-                    let rule = decision
-                        .rule
-                        .map_or("default".into(), |r| format!("rule #{r}"));
+                    let rule = decision.rule_label();
                     let why = if decision.matched_labels.is_empty() {
                         rule
                     } else {
@@ -212,6 +223,7 @@ mod tests {
             matched_labels: labels.iter().map(|l| l.to_string()).collect(),
             reason: None,
             approved: None,
+            org: false,
         }
     }
 
@@ -222,6 +234,7 @@ mod tests {
         let mut log = AuditLog::open(&path, None).unwrap();
         log.record(Event::SessionStart {
             servers: vec!["web".into(), "shell".into()],
+            org_policy: None,
         })
         .unwrap();
         log.record(Event::ToolCall {
@@ -270,7 +283,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
         let mut log = AuditLog::open(&path, None).unwrap();
-        log.record(Event::SessionStart { servers: vec![] }).unwrap();
+        log.record(Event::SessionStart {
+            servers: vec![],
+            org_policy: None,
+        })
+        .unwrap();
         log.record(Event::SessionEnd).unwrap();
         log.record(Event::SessionEnd).unwrap();
         drop(log);

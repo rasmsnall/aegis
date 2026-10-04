@@ -180,6 +180,55 @@ decides. So put conditions on `allow` rules followed by a broader `deny`, as
 above: a `deny` limited to some hosts is a denylist, and every host it
 doesn't name gets through.
 
+### Organization policies
+
+An organization can set a policy that every project's `aegis.toml` runs
+under. It holds the same `[policy]`, `[[source]]` and `[[rule]]` sections
+(and nothing else):
+
+```toml
+# /etc/aegis/org.toml
+[policy]
+default_labels = []        # leave labelling of tools it doesn't list to projects
+
+[[source]]
+tool = "*__get_issue*"
+labels = ["untrusted"]
+
+[[rule]]
+tool = "shell__*"
+when_context_has = ["untrusted"]
+action = "deny"
+reason = "company policy: no shell commands after reading untrusted input"
+
+[[rule]]
+tool = "*__delete_*"
+action = "deny"
+```
+
+The two policies are evaluated separately and combined so the result is
+never looser than the org's alone:
+
+- A call gets the stricter of the two decisions: `deny`, then `ask`, then
+  `allow`. A project can't allow what the org denies or asks about, but it
+  can deny or ask about more.
+- Output gets the labels of both. A project's `default_labels` cover only
+  tools neither policy lists; the org's `default_labels` always apply to
+  tools it doesn't list, so an org policy that should only add rules sets
+  `default_labels = []`.
+
+aegis loads the org policy from `/etc/aegis/org.toml` (on Windows,
+`%ProgramData%\aegis\org.toml`) whenever that file exists, and refuses to
+start if it can't be read or parsed. `--org-policy <file>` (on `run`,
+`check`, `tools` and `replay`) uses another file when none is installed, for
+CI and testing; it can't replace an installed one. `aegis check` shows which
+org policy applies, the SHA-256 of the file is recorded at the start of
+every session in the audit log, and blocked calls name `org rule #N`.
+
+Installing the file is only as strong as the machine's permissions: put it
+where only administrators can write, for example with your device
+management. A developer with administrator rights can remove it.
+
 ### Remote servers
 
 A server with `url` instead of `command` is reached over MCP's Streamable

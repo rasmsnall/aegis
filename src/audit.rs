@@ -127,6 +127,9 @@ pub fn log_arguments(
 pub enum Event {
     SessionStart {
         servers: Vec<String>,
+        /// SHA-256 of the organization policy the session ran under.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_policy: Option<String>,
     },
     /// A tool call and the decision taken on it.
     ToolCall {
@@ -360,6 +363,7 @@ mod tests {
         let mut log = AuditLog::open(path, key).unwrap();
         log.record(Event::SessionStart {
             servers: vec!["web".into()],
+            org_policy: None,
         })
         .unwrap();
         log.record(Event::ToolResult {

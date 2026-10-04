@@ -9,6 +9,9 @@ inputs:
   config:
     description: The aegis.toml to check and replay against.
     default: aegis.toml
+  org-policy:
+    description: An organization policy to layer the config on (path in the repository). Empty for none.
+    default: ""
   logs:
     description: Audit logs to replay (paths or globs, separated by spaces or newlines).
     default: aegis-audit.jsonl
@@ -49,11 +52,14 @@ runs:
       env:
         CONFIG: ${{ inputs.config }}
         LOGS: ${{ inputs.logs }}
+        ORG_POLICY: ${{ inputs.org-policy }}
       run: |
         # Exit status 2 from replay means "changed", not failure.
         set +e -uo pipefail
         shopt -s globstar nullglob
         report="$RUNNER_TEMP/aegis-replay.md"
+        org=()
+        if [ -n "$ORG_POLICY" ]; then org=(--org-policy "$ORG_POLICY"); fi
         {
           echo "<!-- aegis-replay -->"
           echo "### 🛡️ aegis policy replay"
@@ -62,7 +68,7 @@ runs:
           echo
         } > "$report"
 
-        if ! aegis check -c "$CONFIG" > "$RUNNER_TEMP/aegis-check.txt" 2>&1; then
+        if ! aegis check -c "$CONFIG" ${org[@]+"${org[@]}"} > "$RUNNER_TEMP/aegis-check.txt" 2>&1; then
           cat "$RUNNER_TEMP/aegis-check.txt"
           { echo "**\`$CONFIG\` is invalid:**"; echo; echo '```'; cat "$RUNNER_TEMP/aegis-check.txt"; echo '```'; } >> "$report"
           cat "$report" >> "$GITHUB_STEP_SUMMARY"
@@ -76,7 +82,7 @@ runs:
         for pattern in $LOGS; do
           for log in $pattern; do
             found=$((found + 1))
-            aegis replay "$log" -c "$CONFIG" --markdown >> "$report"
+            aegis replay "$log" -c "$CONFIG" ${org[@]+"${org[@]}"} --markdown >> "$report"
             status=$?
             case $status in
               0) ;;

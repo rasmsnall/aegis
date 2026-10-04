@@ -28,11 +28,21 @@ enum Command {
     Run {
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
+        /// Organization policy to layer the config on. An organization policy
+        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
+        /// Windows) always applies and can't be replaced with this.
+        #[arg(long)]
+        org_policy: Option<PathBuf>,
     },
     /// Validate a configuration file without starting any server.
     Check {
         #[arg(short, long, default_value = "aegis.toml")]
         config: PathBuf,
+        /// Organization policy to layer the config on. An organization policy
+        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
+        /// Windows) always applies and can't be replaced with this.
+        #[arg(long)]
+        org_policy: Option<PathBuf>,
     },
     /// Start the configured servers and show every tool with the labels its
     /// output gets and the rules that apply to it. Warns about sources and
@@ -43,6 +53,11 @@ enum Command {
         /// Exit with status 1 if there are any warnings.
         #[arg(long)]
         strict: bool,
+        /// Organization policy to layer the config on. An organization policy
+        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
+        /// Windows) always applies and can't be replaced with this.
+        #[arg(long)]
+        org_policy: Option<PathBuf>,
     },
     /// Verify an audit log's chain (and signatures, given the key).
     Verify {
@@ -102,6 +117,11 @@ enum Command {
         /// Print a Markdown table (for pull request comments) instead.
         #[arg(long)]
         markdown: bool,
+        /// Organization policy to layer the config on. An organization policy
+        /// installed at /etc/aegis/org.toml (%ProgramData%\aegis\org.toml on
+        /// Windows) always applies and can't be replaced with this.
+        #[arg(long)]
+        org_policy: Option<PathBuf>,
     },
 }
 
@@ -118,8 +138,8 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Command::Run { config } => {
-            let config = Config::load(&config)?;
+        Command::Run { config, org_policy } => {
+            let config = Config::load_with_org(&config, org_policy.as_deref())?;
             let key = AuditKey::load(config.audit.key_file.as_deref())?;
             let audit = AuditLog::open(&config.audit.path, key)?;
             let resources = ResourceStore::open(&config.state.path, config.resources.clone())?;
@@ -134,6 +154,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 resources: Some(resources),
                 approval_timeout: Duration::from_secs(config.approval.timeout_secs),
                 max_message_bytes: config.limits.max_message_bytes,
+                org_policy: config.org.as_ref().map(|o| o.sha256.clone()),
             };
             let proxy = Proxy::new(upstreams, config.policy(), options)?;
             proxy
@@ -143,17 +164,36 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             proxy.finish().await?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Check { config } => {
-            let config = Config::load(&config)?;
+        Command::Check { config, org_policy } => {
+            let config = Config::load_with_org(&config, org_policy.as_deref())?;
             println!(
                 "ok: {} servers, {} sources, {} rules",
                 config.servers.len(),
                 config.sources.len(),
                 config.rules.len()
             );
+            if let Some(org) = &config.org {
+                println!(
+                    "under organization policy {} ({} sources, {} rules, sha256 {})",
+                    org.path.display(),
+                    org.sources.len(),
+                    org.rules.len(),
+                    org.sha256
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Tools { config, strict } => tools(&Config::load(&config)?, strict).await,
+        Command::Tools {
+            config,
+            strict,
+            org_policy,
+        } => {
+            tools(
+                &Config::load_with_org(&config, org_policy.as_deref())?,
+                strict,
+            )
+            .await
+        }
         Command::Verify { log, key_file } => {
             let key = AuditKey::load(key_file.as_deref())?;
             let report = audit::verify(&audit::read(&log)?, key.as_ref())?;
@@ -223,8 +263,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             config,
             key_file,
             markdown,
+            org_policy,
         } => {
-            let config = Config::load(&config)?;
+            let config = Config::load_with_org(&config, org_policy.as_deref())?;
             let entries = audit::read(&log)?;
             let key = AuditKey::load(key_file.as_deref())?;
             let verified = audit::verify(&entries, key.as_ref());
@@ -244,10 +285,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         Action::Deny => "now DENIED ",
                         Action::Ask => "now ASKS   ",
                     };
-                    let rule = change
-                        .replayed
-                        .rule
-                        .map_or("default".into(), |r| format!("rule #{r}"));
+                    let rule = change.replayed.rule_label();
                     println!("#{:<6} {verb} {} ({rule})", change.seq, change.tool);
                 }
                 println!(
@@ -349,6 +387,18 @@ async fn tools(config: &Config, strict: bool) -> Result<ExitCode> {
 /// that names it (or the default), plus any argument-dependent sources
 /// checked before it, e.g. `untrusted; trusted if url host docs.rs`.
 fn describe_labels(policy: &Policy, tool: &str) -> String {
+    match &policy.org {
+        // The output gets both sets of labels.
+        Some(org) => format!(
+            "org: {}; project: {}",
+            describe_own_labels(org, tool),
+            describe_own_labels(policy, tool)
+        ),
+        None => describe_own_labels(policy, tool),
+    }
+}
+
+fn describe_own_labels(policy: &Policy, tool: &str) -> String {
     let names = |labels: &[String]| {
         if labels.is_empty() {
             "trusted".to_string()
@@ -376,11 +426,21 @@ fn describe_labels(policy: &Policy, tool: &str) -> String {
         .join("; ")
 }
 
+/// The rules that may decide calls to `tool`: the org's (`org #1 deny`)
+/// then the project's.
 fn describe_rules(policy: &Policy, tool: &str) -> String {
+    let own = describe_own_rules(policy, tool, "");
+    match &policy.org {
+        Some(org) => format!("{}, {own}", describe_own_rules(org, tool, "org ")),
+        None => own,
+    }
+}
+
+fn describe_own_rules(policy: &Policy, tool: &str, prefix: &str) -> String {
     let rules = policy.rules_for(tool);
     if rules.is_empty() {
         let default = policy.default.as_str();
-        return format!("- (default: {default})");
+        return format!("- ({prefix}default: {default})");
     }
     rules
         .iter()
@@ -392,9 +452,9 @@ fn describe_rules(policy: &Policy, tool: &str) -> String {
                 conditions.insert(0, rule.when_context_has.join("|"));
             }
             if conditions.is_empty() {
-                format!("#{r} {action}")
+                format!("{prefix}#{r} {action}")
             } else {
-                format!("#{r} {action} if {}", conditions.join(" and "))
+                format!("{prefix}#{r} {action} if {}", conditions.join(" and "))
             }
         })
         .collect::<Vec<_>>()
@@ -419,7 +479,7 @@ fn replay_markdown(log: &str, report: &replay::Report, verified: bool) -> String
     out += "| Entry | Tool | Recorded | With this policy | Because |\n|---:|---|---|---|---|\n";
     for change in &report.changes {
         let d = &change.replayed;
-        let mut why = d.rule.map_or("default".into(), |r| format!("rule #{r}"));
+        let mut why = d.rule_label();
         if !d.matched_labels.is_empty() {
             why += &format!(", context has {}", d.matched_labels.join(", "));
         }

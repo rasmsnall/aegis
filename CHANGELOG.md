@@ -6,6 +6,15 @@
   `hosts`, `paths` and `args` conditions as sources, e.g. "with secrets in
   context, `web__fetch` only to these hosts". `aegis tools` shows them, and
   `aegis replay` checks them against the logged arguments.
+- **Organization policies.** An org policy (`[policy]`, `[[source]]` and
+  `[[rule]]`) installed at `/etc/aegis/org.toml` (`%ProgramData%\aegis\org.toml`
+  on Windows), or given with `--org-policy`, applies under every project's
+  `aegis.toml`. Each call gets the stricter of the two decisions and output
+  gets both sets of labels, so a project can tighten the org policy but never
+  loosen it. An installed org policy can't be replaced from the command line,
+  and aegis won't start if it can't be read. Its SHA-256 is recorded at the
+  start of every session in the audit log. The GitHub Action takes an
+  `org-policy` input.
 
 ## 0.4.0
 

@@ -45,6 +45,8 @@ pub struct Options {
     pub resources: Option<ResourceStore>,
     pub approval_timeout: Duration,
     pub max_message_bytes: usize,
+    /// SHA-256 of the organization policy in force, for the audit log.
+    pub org_policy: Option<String>,
 }
 
 impl Default for Options {
@@ -56,6 +58,7 @@ impl Default for Options {
             resources: None,
             approval_timeout: Duration::from_secs(300),
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            org_policy: None,
         }
     }
 }
@@ -119,7 +122,10 @@ impl Proxy {
         });
         if let Some(log) = proxy.audit.try_lock().expect("fresh mutex").as_mut() {
             let servers = proxy.upstreams.iter().map(|u| u.name.clone()).collect();
-            log.record(Event::SessionStart { servers })?;
+            log.record(Event::SessionStart {
+                servers,
+                org_policy: options.org_policy,
+            })?;
         }
         Ok(proxy)
     }
@@ -543,13 +549,21 @@ impl Proxy {
             shown.truncate(cut);
             shown += "…";
         }
+        let (rule, default) = if decision.org {
+            (
+                "The organization's rule",
+                "The organization's default policy",
+            )
+        } else {
+            ("Rule", "The default policy")
+        };
         let why = match (&decision.rule, decision.matched_labels.is_empty()) {
             (Some(r), false) => format!(
-                "Rule #{r} asks for approval because this session has read data labelled {}.",
+                "{rule} #{r} asks for approval because this session has read data labelled {}.",
                 decision.matched_labels.join(", ")
             ),
-            (Some(r), true) => format!("Rule #{r} asks for approval."),
-            (None, _) => "The default policy asks for approval.".to_string(),
+            (Some(r), true) => format!("{rule} #{r} asks for approval."),
+            (None, _) => format!("{default} asks for approval."),
         };
         let message = format!(
             "aegis: the agent wants to call {tool} with {shown}\n\n{why}{}\n\nAllow this one call?",
