@@ -20,6 +20,13 @@
 //! from the web is untrusted". A condition that cannot be checked (the
 //! argument is missing, or isn't a web URL) does not match, so the call
 //! falls through to the next source, and in the end to `default_labels`.
+//!
+//! Rules take the same conditions, so "`web__fetch` to docs.rs is fine even
+//! with secrets in context" can go before "no `web__fetch` once the context
+//! has secrets". A rule whose condition can't be checked doesn't match and
+//! the next rule decides, so conditions belong on `allow` rules followed by
+//! a broader `deny`: a `deny` limited to some hosts is a denylist, and any
+//! host it doesn't name gets through.
 
 use std::collections::BTreeMap;
 
@@ -80,6 +87,66 @@ fn default_path_arg() -> String {
     "path".into()
 }
 
+/// Conditions on a call's arguments, shared by sources and rules. All must
+/// hold; none means the call's arguments don't matter.
+#[derive(Debug, Clone, Copy)]
+pub struct Conditions<'a> {
+    pub hosts: &'a [String],
+    pub url_arg: &'a str,
+    pub paths: &'a [String],
+    pub path_arg: &'a str,
+    pub args: &'a BTreeMap<String, Vec<String>>,
+}
+
+impl Conditions<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.paths.is_empty() && self.args.is_empty()
+    }
+
+    /// Whether `arguments` satisfy every condition. One that can't be checked
+    /// (a missing argument, a URL that isn't http or https) doesn't hold.
+    pub fn hold(&self, arguments: &Value) -> bool {
+        if !self.hosts.is_empty() {
+            let Some(host) = arg_str(arguments, self.url_arg).and_then(url_host) else {
+                return false;
+            };
+            if !self.hosts.iter().any(|p| host_matches(p, &host)) {
+                return false;
+            }
+        }
+        if !self.paths.is_empty() {
+            let Some(path) = arg_str(arguments, self.path_arg).map(normalize_path) else {
+                return false;
+            };
+            if !self
+                .paths
+                .iter()
+                .any(|p| glob_match(&normalize_path(p), &path))
+            {
+                return false;
+            }
+        }
+        self.args.iter().all(|(key, patterns)| {
+            arg_str(arguments, key).is_some_and(|v| patterns.iter().any(|p| glob_match(p, v)))
+        })
+    }
+
+    /// Each condition in words, e.g. `url host docs.rs|*.rust-lang.org`.
+    pub fn describe(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.hosts.is_empty() {
+            out.push(format!("{} host {}", self.url_arg, self.hosts.join("|")));
+        }
+        if !self.paths.is_empty() {
+            out.push(format!("{} {}", self.path_arg, self.paths.join("|")));
+        }
+        for (key, patterns) in self.args {
+            out.push(format!("{key}={}", patterns.join("|")));
+        }
+        out
+    }
+}
+
 /// The string at `key` (dotted for nested objects) in `arguments`.
 fn arg_str<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
     key.split('.')
@@ -101,39 +168,24 @@ impl Source {
         }
     }
 
+    pub fn conditions(&self) -> Conditions<'_> {
+        Conditions {
+            hosts: &self.hosts,
+            url_arg: &self.url_arg,
+            paths: &self.paths,
+            path_arg: &self.path_arg,
+            args: &self.args,
+        }
+    }
+
     /// Whether this source depends on the call's arguments.
     pub fn is_conditional(&self) -> bool {
-        !self.hosts.is_empty() || !self.paths.is_empty() || !self.args.is_empty()
+        !self.conditions().is_empty()
     }
 
     /// Whether this source applies to a call of `tool` with `arguments`.
     pub fn matches(&self, tool: &str, arguments: &Value) -> bool {
-        if !glob_match(&self.tool, tool) {
-            return false;
-        }
-        if !self.hosts.is_empty() {
-            let Some(host) = arg_str(arguments, &self.url_arg).and_then(url_host) else {
-                return false;
-            };
-            if !self.hosts.iter().any(|p| host_matches(p, &host)) {
-                return false;
-            }
-        }
-        if !self.paths.is_empty() {
-            let Some(path) = arg_str(arguments, &self.path_arg).map(normalize_path) else {
-                return false;
-            };
-            if !self
-                .paths
-                .iter()
-                .any(|p| glob_match(&normalize_path(p), &path))
-            {
-                return false;
-            }
-        }
-        self.args.iter().all(|(key, patterns)| {
-            arg_str(arguments, key).is_some_and(|v| patterns.iter().any(|p| glob_match(p, v)))
-        })
+        glob_match(&self.tool, tool) && self.conditions().hold(arguments)
     }
 }
 
@@ -151,6 +203,49 @@ pub struct Rule {
     /// Shown to the agent (and logged) when the rule denies a call.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Only match when the URL in `url_arg` is on one of these hosts, as for
+    /// sources.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default = "default_url_arg")]
+    pub url_arg: String,
+    /// Only match when the path in `path_arg`, normalized, matches one of
+    /// these patterns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default = "default_path_arg")]
+    pub path_arg: String,
+    /// Only match when each named argument is a string matching one of its
+    /// patterns.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub args: BTreeMap<String, Vec<String>>,
+}
+
+impl Rule {
+    /// A rule with no label or argument conditions.
+    pub fn new(tool: impl Into<String>, action: Action) -> Self {
+        Self {
+            tool: tool.into(),
+            when_context_has: Vec::new(),
+            action,
+            reason: None,
+            hosts: Vec::new(),
+            url_arg: default_url_arg(),
+            paths: Vec::new(),
+            path_arg: default_path_arg(),
+            args: BTreeMap::new(),
+        }
+    }
+
+    pub fn conditions(&self) -> Conditions<'_> {
+        Conditions {
+            hosts: &self.hosts,
+            url_arg: &self.url_arg,
+            paths: &self.paths,
+            path_arg: &self.path_arg,
+            args: &self.args,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,7 +324,7 @@ impl Policy {
     }
 
     /// 1-based indexes of the rules whose tool pattern matches `tool`,
-    /// whatever their label conditions.
+    /// whatever their label and argument conditions.
     pub fn rules_for(&self, tool: &str) -> Vec<usize> {
         (0..self.rules.len())
             .filter(|&i| glob_match(&self.rules[i].tool, tool))
@@ -237,9 +332,11 @@ impl Policy {
             .collect()
     }
 
-    pub fn decide(&self, tool: &str, context: &LabelSet) -> Decision {
+    /// The first rule matching a call of `tool` with `arguments`, given the
+    /// session's `context`, decides it; else the policy's default.
+    pub fn decide(&self, tool: &str, arguments: &Value, context: &LabelSet) -> Decision {
         for (i, rule) in self.rules.iter().enumerate() {
-            if !glob_match(&rule.tool, tool) {
+            if !glob_match(&rule.tool, tool) || !rule.conditions().hold(arguments) {
                 continue;
             }
             let matched_labels: Vec<String> = rule
@@ -299,8 +396,8 @@ impl Session {
             .collect()
     }
 
-    pub fn check_call(&self, policy: &Policy, tool: &str) -> Decision {
-        policy.decide(tool, &self.context)
+    pub fn check_call(&self, policy: &Policy, tool: &str, arguments: &Value) -> Decision {
+        policy.decide(tool, arguments, &self.context)
     }
 }
 
@@ -341,7 +438,7 @@ pub fn simulate(policy: &Policy, calls: &[SimCall]) -> Simulation {
     let entries = calls
         .iter()
         .map(|call| {
-            let mut decision = session.check_call(policy, &call.tool);
+            let mut decision = session.check_call(policy, &call.tool, &call.arguments);
             if decision.action == Action::Ask {
                 decision.approved = call.approved;
             }
@@ -383,17 +480,11 @@ mod tests {
             ],
             rules: vec![
                 Rule {
-                    tool: "shell__*".into(),
                     when_context_has: vec!["untrusted".into()],
-                    action: Action::Deny,
                     reason: Some("no shell after reading the web".into()),
+                    ..Rule::new("shell__*", Action::Deny)
                 },
-                Rule {
-                    tool: "danger__*".into(),
-                    when_context_has: vec![],
-                    action: Action::Deny,
-                    reason: None,
-                },
+                Rule::new("danger__*", Action::Deny),
             ],
             default: Action::Allow,
             default_labels: vec!["untrusted".into()],
@@ -418,7 +509,9 @@ mod tests {
         let mut session = Session::default();
         session.observe_result(&policy, "mail__read", &serde_json::Value::Null);
         assert_eq!(
-            session.check_call(&policy, "shell__exec").action,
+            session
+                .check_call(&policy, "shell__exec", &Value::Null)
+                .action,
             Action::Deny
         );
 
@@ -436,7 +529,7 @@ mod tests {
         policy.rules[0].action = Action::Ask;
         let mut session = Session::default();
         session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
-        let mut d = session.check_call(&policy, "shell__exec");
+        let mut d = session.check_call(&policy, "shell__exec", &Value::Null);
         assert_eq!(d.action, Action::Ask);
         assert!(!d.runs());
         assert!(d.message("shell__exec").contains("not approved"));
@@ -444,7 +537,11 @@ mod tests {
         assert!(!d.runs());
         d.approved = Some(true);
         assert!(d.runs());
-        assert!(!session.check_call(&policy, "danger__rm").runs());
+        assert!(
+            !session
+                .check_call(&policy, "danger__rm", &Value::Null)
+                .runs()
+        );
     }
 
     #[test]
@@ -453,7 +550,7 @@ mod tests {
         let mut session = Session::default();
         session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
         let text = session
-            .check_call(&policy, "shell__exec")
+            .check_call(&policy, "shell__exec", &Value::Null)
             .message("shell__exec");
         assert_eq!(
             text,
@@ -544,6 +641,63 @@ mod tests {
     }
 
     #[test]
+    fn rules_can_depend_on_arguments() {
+        use serde_json::json;
+        let mut docs = Rule {
+            when_context_has: vec!["secret".into()],
+            ..Rule::new("web__fetch", Action::Allow)
+        };
+        docs.hosts = vec!["docs.rs".into()];
+        let mut ours = Rule::new("github__push_files", Action::Allow);
+        ours.args = [("owner".to_string(), vec!["rasmsnall".to_string()])].into();
+        let policy = Policy {
+            sources: vec![],
+            rules: vec![
+                docs,
+                Rule {
+                    when_context_has: vec!["secret".into()],
+                    ..Rule::new("web__fetch", Action::Deny)
+                },
+                ours,
+                Rule::new("github__push_files", Action::Ask),
+            ],
+            default: Action::Allow,
+            default_labels: vec![],
+        };
+        let mut session = Session::default();
+        let fetch = |session: &Session, url: &str| {
+            session
+                .check_call(&policy, "web__fetch", &json!({ "url": url }))
+                .rule
+        };
+        // Without the label, neither fetch rule applies.
+        assert_eq!(fetch(&session, "https://evil.example/"), None);
+        session.add_labels(["secret".to_string()]);
+        assert_eq!(fetch(&session, "https://docs.rs/serde"), Some(1));
+        for bad in [
+            "https://docs.rs@evil.example/",
+            "https://docs.rs.evil.example/",
+            "file:///etc/passwd",
+        ] {
+            assert_eq!(fetch(&session, bad), Some(2), "{bad}");
+        }
+        // A missing argument doesn't satisfy the condition either.
+        assert_eq!(
+            session.check_call(&policy, "web__fetch", &json!({})).action,
+            Action::Deny
+        );
+
+        let push = |owner: &str| {
+            session
+                .check_call(&policy, "github__push_files", &json!({ "owner": owner }))
+                .action
+        };
+        assert_eq!(push("rasmsnall"), Action::Allow);
+        assert_eq!(push("someone"), Action::Ask);
+        assert_eq!(policy.rules_for("web__fetch"), vec![1, 2]);
+    }
+
+    #[test]
     fn rules_for_ignores_label_conditions() {
         let policy = policy();
         assert_eq!(policy.rules_for("shell__exec"), vec![1]);
@@ -557,21 +711,25 @@ mod tests {
         let mut session = Session::default();
 
         assert_eq!(
-            session.check_call(&policy, "shell__exec").action,
+            session
+                .check_call(&policy, "shell__exec", &Value::Null)
+                .action,
             Action::Allow
         );
 
         let added = session.observe_result(&policy, "web__fetch", &serde_json::Value::Null);
         assert!(added.contains("untrusted"));
 
-        let d = session.check_call(&policy, "shell__exec");
+        let d = session.check_call(&policy, "shell__exec", &Value::Null);
         assert_eq!(d.action, Action::Deny);
         assert_eq!(d.rule, Some(1));
         assert_eq!(d.matched_labels, vec!["untrusted".to_string()]);
 
         // Other tools are unaffected.
         assert_eq!(
-            session.check_call(&policy, "files__read").action,
+            session
+                .check_call(&policy, "files__read", &Value::Null)
+                .action,
             Action::Allow
         );
     }
@@ -588,7 +746,9 @@ mod tests {
         );
         session.observe_result(&policy, "files__read", &serde_json::Value::Null);
         assert_eq!(
-            session.check_call(&policy, "shell__exec").action,
+            session
+                .check_call(&policy, "shell__exec", &Value::Null)
+                .action,
             Action::Deny
         );
     }
@@ -597,9 +757,12 @@ mod tests {
     fn unconditional_rule_and_default() {
         let mut policy = policy();
         let session = Session::default();
-        assert_eq!(session.check_call(&policy, "danger__rm").rule, Some(2));
+        assert_eq!(
+            session.check_call(&policy, "danger__rm", &Value::Null).rule,
+            Some(2)
+        );
         policy.default = Action::Deny;
-        let d = session.check_call(&policy, "files__read");
+        let d = session.check_call(&policy, "files__read", &Value::Null);
         assert_eq!((d.action, d.rule), (Action::Deny, None));
     }
 }

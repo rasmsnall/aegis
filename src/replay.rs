@@ -35,7 +35,8 @@ pub struct Report {
 /// Sources that depend on arguments are checked against the arguments as
 /// logged. With `[audit] arguments = "hash"` or `"omit"`, or an argument that
 /// was redacted, those conditions can't match and the output counts as
-/// untrusted (or whatever `default_labels` says), never as trusted.
+/// untrusted (or whatever `default_labels` says), never as trusted. Rules
+/// that depend on arguments don't match either, so the next rule decides.
 pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
     let mut report = Report::default();
     let mut session = Session::default();
@@ -61,7 +62,7 @@ pub fn replay(entries: &[Entry], policy: &Policy) -> Report {
                     awaiting.entry(tool).or_default().push_back(arguments);
                 }
                 report.calls += 1;
-                let replayed = session.check_call(policy, tool);
+                let replayed = session.check_call(policy, tool, arguments);
                 let would_run = replayed.action != Action::Deny;
                 match (recorded.runs(), would_run) {
                     (true, false) => {
@@ -164,10 +165,8 @@ mod tests {
         let strict = Policy {
             sources: vec![Source::new("web__*", &["untrusted"])],
             rules: vec![Rule {
-                tool: "shell__*".into(),
                 when_context_has: vec!["untrusted".into()],
-                action: Action::Deny,
-                reason: None,
+                ..Rule::new("shell__*", Action::Deny)
             }],
             default: Action::Allow,
             default_labels: vec![],
@@ -188,10 +187,8 @@ mod tests {
         let policy = Policy {
             sources: vec![Source::new("web__*", &["untrusted"])],
             rules: vec![Rule {
-                tool: "shell__*".into(),
                 when_context_has: vec!["untrusted".into()],
-                action: Action::Deny,
-                reason: None,
+                ..Rule::new("shell__*", Action::Deny)
             }],
             default: Action::Allow,
             default_labels: vec![],
@@ -234,10 +231,8 @@ mod tests {
                 Source::new("shell__*", &[]),
             ],
             rules: vec![Rule {
-                tool: "shell__*".into(),
                 when_context_has: vec!["untrusted".into()],
-                action: Action::Deny,
-                reason: None,
+                ..Rule::new("shell__*", Action::Deny)
             }],
             default: Action::Allow,
             default_labels: vec!["untrusted".into()],

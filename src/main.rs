@@ -363,24 +363,10 @@ fn describe_labels(policy: &Policy, tool: &str) -> String {
             base = Some(names(&source.labels));
             break;
         }
-        let mut conditions = Vec::new();
-        if !source.hosts.is_empty() {
-            conditions.push(format!(
-                "{} host {}",
-                source.url_arg,
-                source.hosts.join("|")
-            ));
-        }
-        if !source.paths.is_empty() {
-            conditions.push(format!("{} {}", source.path_arg, source.paths.join("|")));
-        }
-        for (key, patterns) in &source.args {
-            conditions.push(format!("{key}={}", patterns.join("|")));
-        }
         conditional.push(format!(
             "{} if {}",
             names(&source.labels),
-            conditions.join(" and ")
+            source.conditions().describe().join(" and ")
         ));
     }
     let base = base.unwrap_or_else(|| format!("{} (default)", names(&policy.default_labels)));
@@ -401,10 +387,14 @@ fn describe_rules(policy: &Policy, tool: &str) -> String {
         .map(|&r| {
             let rule = &policy.rules[r - 1];
             let action = rule.action.as_str();
-            if rule.when_context_has.is_empty() {
+            let mut conditions = rule.conditions().describe();
+            if !rule.when_context_has.is_empty() {
+                conditions.insert(0, rule.when_context_has.join("|"));
+            }
+            if conditions.is_empty() {
                 format!("#{r} {action}")
             } else {
-                format!("#{r} {action} if {}", rule.when_context_has.join("|"))
+                format!("#{r} {action} if {}", conditions.join(" and "))
             }
         })
         .collect::<Vec<_>>()
