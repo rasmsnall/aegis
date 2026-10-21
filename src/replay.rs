@@ -133,6 +133,7 @@ mod tests {
                     matched_labels: vec![],
                     reason: None,
                     approved: None,
+                    org: false,
                 },
             },
         )
@@ -154,7 +155,13 @@ mod tests {
     fn stricter_policy_reports_newly_blocked_calls() {
         // Recorded under allow-everything.
         let log = vec![
-            entry(0, Event::SessionStart { servers: vec![] }),
+            entry(
+                0,
+                Event::SessionStart {
+                    servers: vec![],
+                    org_policy: None,
+                },
+            ),
             call(1, "shell__exec", Action::Allow),
             result(2, "shell__exec"),
             call(3, "web__fetch", Action::Allow),
@@ -170,6 +177,7 @@ mod tests {
             }],
             default: Action::Allow,
             default_labels: vec![],
+            org: None,
         };
         let report = replay(&log, &strict);
         assert_eq!(report.calls, 3);
@@ -192,6 +200,7 @@ mod tests {
             }],
             default: Action::Allow,
             default_labels: vec![],
+            org: None,
         };
         let report = replay(&log, &policy);
         // web__fetch is now allowed, so its output taints the later shell call.
@@ -236,6 +245,7 @@ mod tests {
             }],
             default: Action::Allow,
             default_labels: vec!["untrusted".into()],
+            org: None,
         };
         let report = replay(&log, &policy);
         // Only the shell call after the untrusted page changes.

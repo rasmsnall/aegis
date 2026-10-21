@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::audit::ArgumentLogging;
-use crate::policy::{Action, Rule, Source};
+use crate::policy::{Action, Org, Rule, Source};
 use crate::resources::ResourceRule;
 
 /// Separator between a server name and its tool name in the tool names aegis
@@ -35,6 +35,71 @@ pub struct Config {
     pub approval: ApprovalConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// The organization's policy this config is layered on, if any. Not part
+    /// of `aegis.toml`: see [`Config::load_with_org`].
+    #[serde(skip)]
+    pub org: Option<OrgPolicy>,
+}
+
+/// Where an organization installs the policy every aegis on the machine
+/// runs under. Only an administrator should be able to write it.
+pub fn system_org_policy_path() -> PathBuf {
+    if cfg!(windows) {
+        let base = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
+        PathBuf::from(base).join("aegis").join("org.toml")
+    } else {
+        PathBuf::from("/etc/aegis/org.toml")
+    }
+}
+
+/// An organization's policy file: `[[source]]` and `[[rule]]` entries, as
+/// in `aegis.toml`, that apply on top of every project's (see
+/// [`crate::policy::Org`]).
+#[derive(Debug)]
+pub struct OrgPolicy {
+    pub org: Org,
+    pub path: PathBuf,
+    /// SHA-256 of the file, recorded in the audit log at session start.
+    pub sha256: String,
+}
+
+impl OrgPolicy {
+    pub fn load(path: &Path) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        let context = || format!("organization policy {}", path.display());
+        let bytes = std::fs::read(path).with_context(context)?;
+        let org: Org = toml::from_str(std::str::from_utf8(&bytes).with_context(context)?)
+            .with_context(context)?;
+        validate_conditions(&org.sources, &org.rules).with_context(context)?;
+        Ok(Self {
+            org,
+            path: path.to_path_buf(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        })
+    }
+}
+
+/// Which organization policy applies: the one installed at `system`, if
+/// there is one, else `requested` (from `--org-policy`), else none.
+/// Requesting a different file than the installed one is an error, so the
+/// installed policy can't be swapped for a looser one.
+pub fn resolve_org_policy(requested: Option<&Path>, system: &Path) -> Result<Option<PathBuf>> {
+    if !system.exists() {
+        return Ok(requested.map(Path::to_path_buf));
+    }
+    if let Some(requested) = requested {
+        let same = match (requested.canonicalize(), system.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if !same {
+            bail!(
+                "an organization policy is installed at {}; --org-policy can't replace it",
+                system.display()
+            );
+        }
+    }
+    Ok(Some(system.to_path_buf()))
 }
 
 /// Where labels that outlive a session (see `[[resource]]`) are kept.
@@ -202,6 +267,17 @@ fn default_call_timeout() -> u64 {
 }
 
 impl Config {
+    /// Loads `path` on top of the organization policy, if one applies (see
+    /// [`resolve_org_policy`]). An organization policy that exists but can't
+    /// be read or parsed is an error: aegis doesn't run without it.
+    pub fn load_with_org(path: &Path, org: Option<&Path>) -> Result<Self> {
+        let mut config = Self::load(path)?;
+        if let Some(org) = resolve_org_policy(org, &system_org_policy_path())? {
+            config.org = Some(OrgPolicy::load(&org)?);
+        }
+        Ok(config)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -277,17 +353,7 @@ impl Config {
         if self.limits.max_message_bytes < 1024 {
             bail!("[limits] max_message_bytes must be at least 1024");
         }
-        for (i, source) in self.sources.iter().enumerate() {
-            for host in &source.hosts {
-                let bare = host.strip_prefix("*.").unwrap_or(host);
-                if bare.is_empty() || bare.contains(['/', ':', '*', '@', ' ']) {
-                    bail!(
-                        "source #{} host {host:?} must be a host name like \"docs.rs\" or \"*.rust-lang.org\", without scheme, port or path",
-                        i + 1
-                    );
-                }
-            }
-        }
+        validate_conditions(&self.sources, &self.rules)?;
         for (i, r) in self.resources.iter().enumerate() {
             if r.key.is_empty() || r.key.split('.').any(str::is_empty) {
                 bail!(
@@ -306,8 +372,35 @@ impl Config {
             rules: self.rules.clone(),
             default: self.policy.default,
             default_labels: self.policy.default_labels.clone(),
+            org: self.org.as_ref().map(|o| o.org.clone()),
         }
     }
+}
+
+fn validate_conditions(sources: &[Source], rules: &[Rule]) -> Result<()> {
+    let hosts = sources
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| {
+            s.hosts
+                .iter()
+                .map(move |h| (format!("source #{}", i + 1), h))
+        })
+        .chain(
+            rules
+                .iter()
+                .enumerate()
+                .flat_map(|(i, r)| r.hosts.iter().map(move |h| (format!("rule #{}", i + 1), h))),
+        );
+    for (what, host) in hosts {
+        let bare = host.strip_prefix("*.").unwrap_or(host);
+        if bare.is_empty() || bare.contains(['/', ':', '*', '@', ' ']) {
+            bail!(
+                "{what} host {host:?} must be a host name like \"docs.rs\" or \"*.rust-lang.org\", without scheme, port or path"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -382,6 +475,64 @@ mod tests {
         for good in ["docs.rs", "*.rust-lang.org", "localhost"] {
             source(good).validate().unwrap();
         }
+    }
+
+    #[test]
+    fn rule_hosts_are_validated() {
+        let rule = |host: &str| {
+            toml::from_str::<Config>(&format!(
+                "[[rule]]\ntool = \"web__*\"\naction = \"allow\"\nhosts = [{host:?}]"
+            ))
+            .unwrap()
+        };
+        assert!(rule("https://docs.rs").validate().is_err());
+        rule("docs.rs").validate().unwrap();
+    }
+
+    #[test]
+    fn installed_org_policy_cannot_be_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("org.toml");
+        let other = dir.path().join("loose.toml");
+        std::fs::write(&other, "").unwrap();
+
+        // Nothing installed: --org-policy is used if given.
+        assert_eq!(resolve_org_policy(None, &system).unwrap(), None);
+        assert_eq!(
+            resolve_org_policy(Some(&other), &system).unwrap(),
+            Some(other.clone())
+        );
+
+        std::fs::write(&system, "").unwrap();
+        assert_eq!(
+            resolve_org_policy(None, &system).unwrap(),
+            Some(system.clone())
+        );
+        assert_eq!(
+            resolve_org_policy(Some(&system), &system).unwrap(),
+            Some(system.clone())
+        );
+        assert!(resolve_org_policy(Some(&other), &system).is_err());
+    }
+
+    #[test]
+    fn org_policy_files_hold_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("org.toml");
+        std::fs::write(&path, "[[rule]]\ntool = \"*__delete_*\"\naction = \"deny\"").unwrap();
+        let org = OrgPolicy::load(&path).unwrap();
+        assert_eq!(org.org.rules.len(), 1);
+        assert_eq!(org.sha256.len(), 64);
+
+        for not_org in [
+            "[[server]]\nname = \"x\"\ncommand = \"x\"",
+            "[policy]\ndefault = \"deny\"",
+        ] {
+            std::fs::write(&path, not_org).unwrap();
+            assert!(OrgPolicy::load(&path).is_err(), "{not_org}");
+        }
+        std::fs::write(&path, "not toml [").unwrap();
+        assert!(OrgPolicy::load(&path).is_err());
     }
 
     #[test]

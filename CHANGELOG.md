@@ -6,6 +6,11 @@
   `hosts`, `paths` and `args` conditions as sources, e.g. "with secrets in
   context, `web__fetch` only to these hosts". `aegis tools` shows them, and
   `aegis replay` checks them against the logged arguments.
+- **Organization policies.** `[[source]]` and `[[rule]]` entries in
+  `/etc/aegis/org.toml` (or `--org-policy` when none is installed) apply on
+  top of every project's config. They only add labels and make decisions
+  stricter, so a project can't loosen them. Their SHA-256 is recorded in the
+  audit log at session start.
 
 ## 0.4.0
 

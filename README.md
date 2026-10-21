@@ -180,6 +180,40 @@ decides. So put conditions on `allow` rules followed by a broader `deny`, as
 above: a `deny` limited to some hosts is a denylist, and every host it
 doesn't name gets through.
 
+### Organization policies
+
+An organization can add `[[source]]` and `[[rule]]` entries that apply on top
+of every project's `aegis.toml`, in a file at `/etc/aegis/org.toml`
+(`%ProgramData%\aegis\org.toml` on Windows):
+
+```toml
+[[source]]
+tool = "*__get_issue*"
+labels = ["untrusted"]
+
+[[rule]]
+tool = "shell__*"
+when_context_has = ["untrusted"]
+action = "deny"
+reason = "company policy: no shell commands after reading untrusted input"
+```
+
+The org's entries only add, so a project can tighten them but never loosen
+them:
+
+- Output gets the labels of the first matching org source on top of the
+  project's.
+- If an org rule matches a call, the stricter of its decision and the
+  project's wins (`deny`, then `ask`, then `allow`).
+- Where no org entry matches, the project decides alone.
+
+If the file exists but can't be read or parsed, aegis doesn't start.
+`--org-policy <file>` (on `run`, `check` and `replay`) uses another file when
+none is installed, for CI and testing; it can't replace an installed one.
+Blocked calls name `org rule #N`, and the file's SHA-256 is recorded at the
+start of every session in the audit log. The file is only as safe as its
+permissions: put it where only administrators can write.
+
 ### Remote servers
 
 A server with `url` instead of `command` is reached over MCP's Streamable
