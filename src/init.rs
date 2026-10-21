@@ -588,7 +588,7 @@ mod tests {
             "fetch__fetch",
             &json!({ "url": "https://evil.example" }),
         );
-        let check = |tool: &str| session.check_call(&policy, tool).action;
+        let check = |tool: &str| session.check_call(&policy, tool, &json!({})).action;
         use crate::policy::Action;
         assert_eq!(check("desktop-commander__execute_command"), Action::Deny);
 
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             clean
-                .check_call(&policy, "desktop-commander__execute_command")
+                .check_call(&policy, "desktop-commander__execute_command", &json!({}))
                 .action,
             Action::Allow
         );

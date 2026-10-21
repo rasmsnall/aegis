@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Rules that depend on arguments.** `[[rule]]` entries take the same
+  `hosts`, `paths` and `args` conditions as sources, e.g. "with secrets in
+  context, `web__fetch` only to these hosts". `aegis tools` shows them, and
+  `aegis replay` checks them against the logged arguments.
+
 ## 0.4.0
 
 - **Remote servers.** `url` (with `headers`, where `${VAR}` reads the

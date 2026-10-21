@@ -149,6 +149,37 @@ If a condition can't be checked (the argument is missing, or isn't a web
 URL) the source doesn't match, and the next one decides, down to
 `default_labels`.
 
+### Rules that depend on arguments
+
+Rules take the same `hosts`, `paths` and `args` conditions (with `url_arg`
+and `path_arg`), so a rule can depend on where a call goes, not just which
+tool it is. Once a session has read secrets, say, its requests can be held
+to hosts you know:
+
+```toml
+[[source]]                 # reading these marks the session as holding secrets
+tool = "files__read_file"
+labels = ["secret"]
+paths = [".env", "*.pem", "secrets/*"]
+
+[[rule]]                   # with secrets in context, fetch only from known hosts
+tool = "web__fetch"
+when_context_has = ["secret"]
+hosts = ["docs.rs", "*.rust-lang.org"]
+action = "allow"
+
+[[rule]]
+tool = "web__fetch"
+when_context_has = ["secret"]
+action = "deny"
+reason = "no requests to unknown hosts once secrets are in context"
+```
+
+A rule whose condition can't be checked doesn't match, and the next rule
+decides. So put conditions on `allow` rules followed by a broader `deny`, as
+above: a `deny` limited to some hosts is a denylist, and every host it
+doesn't name gets through.
+
 ### Remote servers
 
 A server with `url` instead of `command` is reached over MCP's Streamable

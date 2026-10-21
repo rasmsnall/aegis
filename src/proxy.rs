@@ -448,7 +448,7 @@ impl Proxy {
         let (mut decision, context) = {
             let session = self.session.lock().await;
             (
-                session.check_call(&self.policy, &name),
+                session.check_call(&self.policy, &name, arguments),
                 session.context().clone(),
             )
         };
